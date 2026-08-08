@@ -1690,6 +1690,97 @@ def cmd_leave(args):
     print(f"✓ 已离开总线，释放了 {r['released_locks']} 个锁，未决交接已取消")
 
 
+# ==================== 网络：Tailscale 状态与引导安装 ====================
+
+def run_step(desc, cmd, sudo=False):
+    """执行一步安装操作；sudo 步骤先明示再跑（密码/登录需人工）。"""
+    print(f"→ {desc}")
+    print(f"  $ {' '.join(cmd)}")
+    r = subprocess.run(cmd)  # 继承终端 stdio，sudo/登录可交互
+    if r.returncode != 0:
+        print(f"  ✗ 失败（exit {r.returncode}）。")
+        return False
+    print("  ✓")
+    return True
+
+
+def cmd_net(args):
+    import shutil
+    sub = getattr(args, "net_cmd", None)
+    ts = shutil.which("tailscale")
+    ip = tailscale_ip()
+
+    if sub in (None, "status"):
+        if ip:
+            print(f"✓ Tailscale 已接入，本机地址 {ip}")
+            print("  bus serve 会自动广告此地址，对端 join 自动选路，无需任何配置。")
+        elif ts:
+            print("⚠ Tailscale 已安装但未接入（tailscale up 未完成）。")
+            print("  运行 bus net setup 继续引导。")
+        else:
+            print("✗ 未检测到 Tailscale。")
+            print("  运行 bus net setup 自动安装（macOS 用 Homebrew，Linux 用官方脚本）；")
+            print("  或手动安装：https://tailscale.com/download")
+        return
+
+    if sub == "setup":
+        if ip:
+            print(f"✓ Tailscale 已就绪（{ip}），无需安装。")
+            return
+        print("agent-bus 网络引导：将安装并接入 Tailscale。")
+        print("过程中会有两处需要人工：sudo 密码、浏览器登录 tailnet 授权。\n")
+        if not ts:
+            if sys.platform == "darwin":
+                brew = shutil.which("brew")
+                if not brew:
+                    print("✗ 未检测到 Homebrew。请先装 brew（https://brew.sh），"
+                          "或从 https://tailscale.com/download/mac 安装 Tailscale GUI 版。")
+                    return
+                if not run_step("安装 tailscale（Homebrew formula）",
+                                [brew, "install", "tailscale"]):
+                    print("可改用 GUI 版：https://tailscale.com/download/mac")
+                    return
+            elif sys.platform.startswith("linux"):
+                print("→ 使用 Tailscale 官方安装脚本（自动识别发行版）")
+                print("  $ curl -fsSL https://tailscale.com/install.sh | sh")
+                r = subprocess.run(
+                    "curl -fsSL https://tailscale.com/install.sh | sh", shell=True)
+                if r.returncode != 0:
+                    print("  ✗ 安装脚本失败，请手动安装：https://tailscale.com/download")
+                    return
+                print("  ✓")
+            else:
+                print(f"✗ 暂不支持的平台（{sys.platform}），请手动安装："
+                      "https://tailscale.com/download")
+                return
+            ts = shutil.which("tailscale")
+        # 启动守护进程
+        if sys.platform == "darwin":
+            if not run_step("启动 tailscaled 守护进程（需 sudo 密码）",
+                            ["sudo", "brew", "services", "start", "tailscale"], sudo=True):
+                return
+        elif sys.platform.startswith("linux"):
+            if not run_step("启动 tailscaled 守护进程（需 sudo 密码）",
+                            ["sudo", "systemctl", "enable", "--now", "tailscaled"], sudo=True):
+                return
+        # 接入 tailnet（浏览器授权）
+        print("→ 接入 tailnet：接下来会弹出浏览器登录地址，完成授权即可")
+        up = ["tailscale", "up"]
+        r = subprocess.run(up)
+        if r.returncode != 0:
+            r = subprocess.run(["sudo"] + up)
+        ip = tailscale_ip()
+        if ip:
+            print(f"\n✓ 全部就绪，本机 Tailscale 地址：{ip}")
+            print("  重启 bus serve 即自动广告该地址；对端 bus join 自动选路。")
+        else:
+            print("\n⚠ 安装完成但未检测到 100.x 地址，请检查 `tailscale status` 输出，"
+                  "或把输出发来排查。")
+        return
+
+    die("用法：bus net [status|setup]")
+
+
 # ==================== CLI hooks（自动锁 / 自动同步）====================
 #
 # 架构：业务逻辑只此一份（bus hook <cli>），各 CLI 只差一层薄适配：
@@ -2189,6 +2280,10 @@ def main():
     p.add_argument("--scope", choices=["project", "global"], default="global",
                    help="claude/opencode/pi 支持 project 级，默认 global")
     p.set_defaults(fn=cmd_install_hooks)
+
+    p = sub.add_parser("net", help="网络状态与 Tailscale 引导安装")
+    p.add_argument("net_cmd", nargs="?", choices=["status", "setup"])
+    p.set_defaults(fn=cmd_net)
 
     args = ap.parse_args()
     args.fn(args)

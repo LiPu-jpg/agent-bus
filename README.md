@@ -42,6 +42,7 @@ python3 bus.py handoff B auth-v2 --state "实现80%" --next "改 tests" --patch
 
 ## 多机互联（含 Tailscale 自动支持）
 
+- **没装 Tailscale？** `bus net setup` 一条命令引导安装：macOS 走 Homebrew、Linux 走官方脚本，自动装好后启动守护进程，只在两个绕不开的人工点停下——sudo 密码、浏览器登录 tailnet 授权。`bus net status` 随时查看状态。
 - `bus serve` 自动探测 **Tailscale IPv4**（`tailscale ip -4`）：检测到就把它作为首选广告地址，未检测到回退局域网 IP 并提示安装。所有候选地址（Tailscale / 局域网 / 本机）都会写进 `.bus/hub.json` 的 `alt_urls`。
 - `bus join`（不带 `--hub`，读 hub.json）会**逐个探测候选地址、自动选路**，主地址不通自动换备选——你在公司局域网 join 过一次，回家切到 Tailscale 也无需改任何配置。
 - 也就是说：多台机器装好 Tailscale 后，整个互联是**零配置**的，而且流量走 WireGuard 加密，顺带解决明文 HTTP 的问题。
