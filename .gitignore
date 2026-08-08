@@ -1,0 +1,10 @@
+# agent-bus 运行时数据
+.bus/
+.bus-peer*.json
+
+# Python
+__pycache__/
+*.pyc
+
+# 系统
+.DS_Store
