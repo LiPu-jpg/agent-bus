@@ -2,13 +2,23 @@
 
 多端 / 多 CLI agent 协作总线。解决"服务器 A 一个会话、电脑 B 一个会话、同项目几个会话、还可能是不同 CLI"之间无法配合的问题。
 
-不改你的工作流：代码照常走 git，agent-bus 只管**协调**——锁、消息、改动历史、共享黑板。单文件、Python 3.8+ 标准库、零依赖。
+不改你的工作流：代码照常走 git，agent-bus 只管**协调**——谁拥有什么工作、谁在改什么文件、谁跟谁说好了什么、做了一半的工作怎么交给别人。单文件、Python 3.8+ 标准库、零依赖。
 
-## 架构
+## 核心抽象
 
-- **hub**：`bus.py serve` 启动的小型 HTTP 服务，跑在任一端可达的机器上（通常就是第一个会话所在的机器）。所有状态存在一个数据目录里（默认 `.bus/`）：`state.json` + `board.md` + `changes/*.md`，全是纯文本，可以直接提交进项目 git 做持久化和审计。
-- **client**：同一个 `bus.py` 的子命令，agent（或人）在项目目录里直接调用。
-- **skill**：`skill/SKILL.md` 是行为契约，装进各 CLI 的 skills 目录后，任何 agent 都遵守同一套纪律。
+```
+Peer      身份 / rank 权限次序 / 心跳
+Claim     工作声明："这件事此刻归谁管"（运行时协调状态，不是任务管理）
+Lock      资源排他：目录 / 文件 / 行区域，租约自动续期，--wait 排队
+Message   公聊 + 私聊（阻塞型：回合制协商 → 高权限方裁决）
+Handoff   两阶段工作交接：claim + 锁 + 上下文 capsule 原子转移
+Takeover  对方掉线时的被动接管（从事件流合成事故现场 capsule）
+Change    改动小历史（类似 git log 的"谁改了什么"）
+Board     共享黑板（结论性信息，决策自动归档）
+EventLog  events.jsonl：一切状态变更的事实源，可审计可回溯
+```
+
+边界声明：agent-bus 是 **coordination layer**，不是任务管理器（那是 beads / Jira 的地盘）、不是 orchestrator（不 spawn、不调度 agent）、不替代 git（代码内容永远走 git）。
 
 ## 快速开始
 
@@ -19,12 +29,23 @@ python3 bus.py serve            # 打印 hub 地址 http://<ip>:8977#<token>
 # 每个端加入（同项目多会话务必各起 --name）
 python3 bus.py join --hub 'http://<ip>:8977#<token>' --name A --cli kimi
 
-# 日常三件套的其余部分
-python3 bus.py sync                                  # 心跳 + 收消息
-python3 bus.py lock src/a.ts --note "改登录接口"      # 改文件前先锁
-python3 bus.py done "登录接口迁到 /v2/auth" --files src/a.ts
-python3 bus.py unlock --all
+# 典型工作循环
+python3 bus.py claim auth-v2 --note "迁移登录接口" --scope src/auth/
+python3 bus.py lock src/auth/ --note "改认证"
+# ... 干活 ...
+python3 bus.py done "登录接口迁到 /v2/auth" --files src/auth/api.ts
+python3 bus.py unlock --all && python3 bus.py sync
+
+# 收工交接给另一台机器上的 B
+python3 bus.py handoff B auth-v2 --state "实现80%" --next "改 tests" --patch
 ```
+
+## 多机互联（含 Tailscale 自动支持）
+
+- `bus serve` 自动探测 **Tailscale IPv4**（`tailscale ip -4`）：检测到就把它作为首选广告地址，未检测到回退局域网 IP 并提示安装。所有候选地址（Tailscale / 局域网 / 本机）都会写进 `.bus/hub.json` 的 `alt_urls`。
+- `bus join`（不带 `--hub`，读 hub.json）会**逐个探测候选地址、自动选路**，主地址不通自动换备选——你在公司局域网 join 过一次，回家切到 Tailscale 也无需改任何配置。
+- 也就是说：多台机器装好 Tailscale 后，整个互联是**零配置**的，而且流量走 WireGuard 加密，顺带解决明文 HTTP 的问题。
+- 没有 Tailscale 的可选方案：Cloudflare Tunnel（`cloudflared tunnel --url http://localhost:8977`，零对端安装、白送 TLS）、SSH 反向隧道（`autossh -R 8977:localhost:8977 user@vps`）。
 
 ## 命令速查
 
@@ -32,27 +53,45 @@ python3 bus.py unlock --all
 |---|---|
 | `serve [--port 8977] [--dir .bus]` | 启动 hub |
 | `join --hub <url#token> [--name N]` | 加入总线，按顺序分配 rank |
-| `sync` | 心跳 + 新公聊 + 新改动 + 私聊（阻塞优先）+ 待裁决 |
-| `lock <路径> [-r 起:止] [--note]` | 目录锁（`/`结尾）/ 文件锁 / 区域锁 |
+| `sync` | 心跳 + 新公聊/改动/私聊/交接/声明 一屏看完 |
+| `claim <名> [--note] [--scope] [--status] [--waiting-on]` | 声明/更新工作归属 |
+| `claims [--all]` / `unclaim <名> [--abandoned]` | 查看 / 关闭工作声明 |
+| `lock <路径> [-r 起:止] [--ttl 分钟] [--wait]` | 加锁：目录（`/`结尾）/文件/区域；租约；排队 |
 | `unlock <路径> \| --all [--force]` | 解锁；force 需更高权限/主机/对方掉线 |
-| `locks` / `peers` / `status` | 看锁 / 看各端与权限 / 看全貌 |
-| `done "摘要" [--files] [--detail]` | 记录改动（自动附 git commit），别人 sync 可见 |
-| `log [-n]` | 改动历史 |
+| `locks` / `peers` / `status` | 看锁与等待队列 / 各端与权限 / 全貌 |
+| `handoff <对方\|anyone> <claim> [--state] [--blockers] [--next] [--patch]` | 发起交接（两阶段） |
+| `capsule <hid>` / `accept <hid>` / `reject <hid>` | 看交接详情 / 接收 / 拒绝 |
+| `takeover <claim> --reason "..."` | 接管掉线（或低权限）方的工作 |
+| `done "摘要" [--files] [--detail]` | 记录改动（自动附 git commit） |
+| `log [-n]` / `events [-n] [--type]` | 改动历史 / 事件流审计 |
 | `say all "..."` | 公聊 |
 | `say <名字> "..." [--blocking] [--rounds N] [--deadline M]` | 私聊；阻塞型限定回合与时限 |
-| `reply <tid> "..."` | 回复私聊 |
-| `resolve <tid> "共识"` | 双方达成一致，归档黑板 |
-| `decide <tid> "最终方案"` | 高权限方/主机在谈不拢时裁决定案 |
-| `thread <tid>` | 看私聊全文 |
+| `reply / resolve / decide / thread` | 私聊回复 / 共识归档 / 高权限裁决 / 看全文 |
 | `board` / `board add <分区> "..."` | 共享黑板 |
-| `leave` | 离开并释放自己的锁 |
+| `leave` | 离开：释放锁、取消未决交接 |
 
 ## 关键语义
 
-- **权限**：rank 0 = 主机，权限最高；掉线后在线 rank 最小者接任。强制解锁、超时裁决都按此次序裁决权限。
-- **阻塞私聊**：默认 6 回合 / 30 分钟，任一耗尽即转"待裁决"，由双方中权限高者（或主机）`decide` 总结定案，结果自动写入黑板「决策记录」。
-- **心跳**：任何命令都算心跳；10 分钟无心跳视为掉线，其锁可被任何人 `--force` 解除。
-- **同项目多会话**：`join --name 不同名字`，身份存为 `.bus-peer.<名字>.json`；用 `BUS_PEER_FILE` 环境变量切换当前会话身份。
+- **权限**：rank 0 = 主机；掉线后在线 rank 最小者接任。强制解锁、超时裁决、强制接管都按此次序判权限。
+- **锁租约**：默认 15 分钟，持锁者任何操作自动续期；停止续期（掉线）即自动过期，等待队列按序递补。
+- **阻塞私聊**：默认 6 回合 / 30 分钟，任一耗尽转"待裁决"，权限高者 `decide` 一锤定音，自动归档黑板「决策记录」。
+- **Handoff**：offer 期间锁被保护（不可 unlock/force）；`accept` 时 claim + 锁原子转移；`reject`/超时（30 分钟）自动还原。工作区有未提交改动时必须 `--patch` 打包或先 commit。
+- **Takeover**：对方在线→仅更高权限者可强制接管；异常掉线→20 分钟内仅更高权限者/主机，之后任何人；主动 leave→任何人立即可接管。salvage capsule 标记 partial，先核对 git 现场再动手。
+- **心跳**：任何命令都算心跳；10 分钟无操作视为掉线。
+- **同项目多会话**：`join --name 不同名字`，身份存为 `.bus-peer.<名字>.json`；`BUS_PEER_FILE` 环境变量切换当前会话身份。
+
+## 数据目录（.bus/）
+
+```
+state.json     状态快照
+events.jsonl   事件流（事实源）：peer.joined / lock.acquired / handoff.accepted / ...
+board.md       共享黑板
+hub.json       hub 地址与 token（可随 git 同步，供对端自动发现）
+changes/       改动详情 md
+capsules/      交接携带的 wip patch
+```
+
+纯文本，可整个提交进项目 git 做持久化与审计。hub 单点故障时，任一端可用同一数据目录重新 `serve`，其余端改 `--hub` 重新 join。
 
 ## 安装为 skill
 
@@ -65,8 +104,36 @@ install -m755 bus.py ~/.local/bin/bus   # 可选：让 bus 直接在 PATH 上
 
 其他 CLI（Claude Code、Codex 等）同理，把 `skill/SKILL.md` 放进它们的指令/技能目录即可——契约是纯文本，与 CLI 无关。
 
-## 已知取舍（MVP）
+## Hooks：把纪律变成机制（v0.3）
 
-- 锁是 advisory（约定式），靠 skill 纪律保证；跨 CLI 无法做强制锁，审计靠 `state.json` 全量可追溯。
-- hub 单点：主机所在机器挂了，任一端可用同一数据目录重新 `serve`（数据目录建议随项目 git 同步），其余端改 `--hub` 重新 join。
-- 消息/改动流目前无上限截断（`status` 只返回最近 50 条），规模大了再做分片。
+skill 契约靠 agent 自觉，hooks 把它升级为半强制：**写文件前自动加锁、锁冲突直接拦截这次工具调用、回合结束自动心跳并提醒未处理事项**。
+
+```bash
+bus install-hooks claude            # ~/.claude/settings.json
+bus install-hooks kimi              # ~/.kimi-code/config.toml
+bus install-hooks codex             # ~/.codex/config.toml
+bus install-hooks opencode          # ~/.config/opencode/plugins/agent-bus.ts
+bus install-hooks pi                # ~/.pi/agent/extensions/agent-bus/index.ts
+bus install-hooks all               # 全部
+# claude/opencode/pi 支持 --scope project（装到当前项目目录）
+```
+
+- 原理：`bus hook <cli>` 从 stdin 读各 CLI 的 hook payload，exit 0 放行 / exit 2 拦截（stderr 即拦截原因，会回灌给模型）。
+- 覆盖：Edit/Write 类工具自动锁；Bash 类工具嗅探 `>`、`tee`、`sed -i` 的写入目标做冲突拦截（尽力而为，允许漏判）；Stop/idle 事件自动心跳，有阻塞私聊或待接收交接时拦截收工。
+- 已实测：Claude Code 与 Kimi Code 的 payload 协议（exit 2 / stderr / JSON 语义）。Codex 的 hooks 配置按其官方"Claude 风格"文档生成，OpenCode/PI 按官方插件文档生成——这三家请以实际版本实测为准。
+- hub 不可达时默认 fail-open（放行）；`BUS_HOOK_ENFORCE=1` 切换为 fail-closed。
+
+## 已知取舍
+
+- 锁与 claim 是 advisory + hook 半强制（bash 改写文件无法 100% 拦截），`events.jsonl` 全量审计兜底。
+- 网络为明文 HTTP + token，适用于可信内网/VPN（推荐 Tailscale）；跨公网请走 SSH 转发/Cloudflare Tunnel。
+- 死锁检测（A 等 B、B 等 A 成环）暂未实现，等待队列已是 FIFO，环检测在 roadmap。
+- 消息/事件流无上限截断（查询只返回最近 N 条），规模大了再做分片与 compaction。
+
+## Roadmap
+
+- v0.1 ✅ 锁/私聊/裁决/改动历史/黑板
+- v0.2 ✅ Event Log、Claim、Handoff/Takeover、锁租约与等待队列
+- v0.3 ✅ CLI hooks：自动锁/冲突拦截/自动心跳，支持 Claude Code、Kimi Code、Codex、OpenCode、PI
+- v0.4 规划：结构化消息（--type finding/blocker + ACK）、`bus assign` 任务下发、scope 命名空间、decision versioning（supersede/revoke）、死锁检测、`sync --wait` long-polling
+- 更远的：capability registry、agentd（watch 事件流自动起 headless agent）、MCP/ACP adapter、hub replication

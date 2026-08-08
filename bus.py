@@ -3,14 +3,17 @@
 """
 agent-bus — 多端 agent 协作总线（单文件、零依赖，Python 3.8+ 标准库）
 
-功能：
-  - peer 注册与权限次序（第一个 join 的是主机，rank 最小权限最高）
-  - 多粒度锁：目录锁（src/auth/）、文件锁（a.ts）、区域锁（-r 10:50）
-  - 公聊（say all）与私聊（阻塞型：回合制协商 + 高权限裁决）
-  - 改动小历史（done），类似 git log 的"谁改了什么"
-  - 共享黑板（board.md），结论性信息的公共维护区
+v0.2 核心抽象：
+  Peer（身份/权限/心跳）  Claim（工作声明）   Lock（目录/文件/区域 + 租约 + 等待队列）
+  Message（公聊/私聊/阻塞协商/裁决）  Handoff（两阶段交接 + 死后接管）
+  Change（改动小历史）  Board（共享黑板）  Event Log（全部状态变更的事实源）
 
-用法见 README.md / SKILL.md。
+数据目录（默认 .bus/）：
+  state.json    状态快照（缓存）
+  events.jsonl  事件流（事实源，一切写操作追加）
+  board.md      共享黑板
+  changes/      改动详情
+  capsules/     交接 capsule 的 wip patch
 """
 import argparse
 import json
@@ -27,8 +30,11 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.1.0"
+VERSION = "0.3.0"
 TTL = 600                     # peer 心跳有效期（秒），超时视为掉线
+LOCK_LEASE = 900              # 锁租约（秒），持锁者任何操作自动续期
+LOCK_LEASE_MAX = 8 * 3600     # 自定义 --ttl 上限
+HANDOFF_TTL = 1800            # 交接 offer 有效期（秒）
 DEFAULT_PORT = 8977
 DEFAULT_ROUNDS = 6            # 阻塞私聊默认协商回合数
 DEFAULT_DEADLINE_MIN = 30     # 阻塞私聊默认时限（分钟）
@@ -78,6 +84,10 @@ def region_overlap(r1, r2):
     return a1 <= b2 and a2 <= b1
 
 
+def lock_label(l):
+    return l["path"] + (f"({l['region']})" if l.get("region") else "")
+
+
 class BusError(Exception):
     def __init__(self, code, msg):
         super().__init__(msg)
@@ -88,10 +98,14 @@ class BusError(Exception):
 # ==================== 服务端：状态与业务逻辑 ====================
 
 class Bus:
+    CLAIM_STATUSES = ("claimed", "working", "blocked", "review", "done", "abandoned")
+
     def __init__(self, datadir):
         self.dir = os.path.abspath(datadir)
         os.makedirs(os.path.join(self.dir, "changes"), exist_ok=True)
+        os.makedirs(os.path.join(self.dir, "capsules"), exist_ok=True)
         self.state_path = os.path.join(self.dir, "state.json")
+        self.events_path = os.path.join(self.dir, "events.jsonl")
         self.board_path = os.path.join(self.dir, "board.md")
         self.mu = threading.RLock()
         if os.path.exists(self.state_path):
@@ -101,13 +115,15 @@ class Bus:
             self.state = {
                 "token": uuid.uuid4().hex,
                 "peer_seq": 0, "msg_seq": 0, "change_seq": 0, "thread_seq": 0,
-                "peers": {},    # id -> {id,name,host,cli,rank,joined_at,last_seen,cursors}
-                "locks": {},    # key -> {key,path,region,owner,owner_name,owner_rank,note,since}
-                "threads": {},  # id -> {id,topic,parties,blocking,rounds_left,deadline,status,messages,resolution}
-                "inbox": {},    # peer_id -> [ {id,from,from_name,body,thread,blocking,ts,read} ]
-                "public": [],   # [ {id,from,from_name,body,ts} ]
-                "changes": [],  # [ {id,peer,name,summary,files,commit,detail_file,ts} ]
+                "peers": {}, "locks": {}, "threads": {},
+                "inbox": {}, "public": [], "changes": [],
             }
+        # 向后兼容：补充 v0.2 新增字段
+        self.state.setdefault("event_seq", 0)
+        self.state.setdefault("handoff_seq", 0)
+        self.state.setdefault("claims", {})
+        self.state.setdefault("handoffs", {})
+        self.state.setdefault("waiters", [])
         self.token = self.state["token"]
         if not os.path.exists(self.board_path):
             with open(self.board_path, "w", encoding="utf-8") as f:
@@ -118,6 +134,13 @@ class Bus:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.state, f, ensure_ascii=False, indent=1)
         os.replace(tmp, self.state_path)
+
+    def _emit(self, etype, **data):
+        """一切状态变更写事件流（调用方须持锁）。"""
+        self.state["event_seq"] += 1
+        ev = {"seq": self.state["event_seq"], "ts": now(), "type": etype, **data}
+        with open(self.events_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
 
     # ---- peer ----
 
@@ -136,7 +159,12 @@ class Bus:
         p = self.state["peers"].get(pid)
         if not p:
             raise BusError(404, f"未知 peer: {pid}（先 join）")
-        p["last_seen"] = now()  # 任何操作都算一次心跳
+        t = now()
+        p["last_seen"] = t  # 任何操作都算一次心跳
+        with self.mu:
+            for l in self.state["locks"].values():
+                if l["owner"] == pid:  # 顺带续租
+                    l["expires"] = t + l.get("lease", LOCK_LEASE)
         return p
 
     def peer_by_name(self, name):
@@ -154,10 +182,11 @@ class Bus:
                 "id": pid, "name": name or f"agent-{rank}",
                 "host": host or "?", "cli": cli or "?",
                 "rank": rank, "joined_at": now(), "last_seen": now(),
-                # 新端只看到 join 之后的新消息，历史用 log/chat 翻
                 "cursors": {"public": self.state["msg_seq"],
                             "changes": self.state["change_seq"]},
             }
+            self._emit("peer.joined", peer=name or f"agent-{rank}", rank=rank,
+                       host=host or "?", cli=cli or "?")
             self.save()
             return self.state["peers"][pid]
 
@@ -165,38 +194,83 @@ class Bus:
         me = self.get_peer(pid)
         with self.mu:
             me["last_seen"] = 0
+            # 取消我发出的未决交接，锁的 pending 标记一并解除
+            for h in self.state["handoffs"].values():
+                if h["status"] == "offered" and h["from"] == pid:
+                    h["status"] = "cancelled"
+                    c = self.state["claims"].get(h["claim"])
+                    if c and c["status"] == "handing_off":
+                        c["status"] = "working"
+                    self._emit("handoff.cancelled", id=h["id"], claim=h["claim"],
+                               actor=me["name"], reason="leave")
             released = [k for k, l in self.state["locks"].items() if l["owner"] == pid]
             for k in released:
                 del self.state["locks"][k]
+            # 我的等待排队也清掉
+            self.state["waiters"] = [w for w in self.state["waiters"] if w["peer"] != pid]
+            self._emit("peer.left", peer=me["name"], released_locks=len(released))
+            if released:
+                self._grant_waiters()
             self.save()
             return len(released)
 
-    # ---- 锁 ----
+    # ---- 锁（租约 + 等待队列）----
 
-    def lock(self, pid, path, region, note):
+    def _find_conflict(self, pid, path, region):
+        for l in self.state["locks"].values():
+            if l["owner"] == pid:
+                continue
+            if paths_conflict(l["path"], path) and \
+                    (l["path"] != path or region_overlap(l["region"], region)):
+                return l
+        return None
+
+    def lock(self, pid, path, region, note, ttl_min=None, wait=False):
         path = norm_path(path)
         if region and not re.fullmatch(r"\d+:\d+", region):
             raise BusError(400, "region 格式应为 起始行:结束行，如 10:50")
         me = self.get_peer(pid)
+        lease = LOCK_LEASE
+        if ttl_min:
+            lease = max(60, min(int(ttl_min * 60), LOCK_LEASE_MAX))
         with self.mu:
+            holder = self._find_conflict(pid, path, region)
+            if holder:
+                if wait:
+                    self.state["waiters"].append({
+                        "peer": pid, "peer_name": me["name"], "path": path,
+                        "region": region, "note": note or "", "since": now(),
+                    })
+                    pos = len(self.state["waiters"])
+                    self._emit("lock.waiting", path=path, region=region,
+                               actor=me["name"], holder=holder["owner_name"])
+                    self.save()
+                    return {"waiting": True, "position": pos,
+                            "holder": holder["owner_name"]}
+                pend = (f"，且正包含在交接 {holder['pending']} 中"
+                        if holder.get("pending") else "")
+                raise BusError(
+                    409,
+                    f"锁冲突：{lock_label(holder)} 正被 {holder['owner_name']}"
+                    f"(rank{holder['owner_rank']}) 持有{pend}"
+                    + (f"：{holder['note']}" if holder.get("note") else "")
+                    + "（可加 --wait 排队）")
             key = f"{path}|{region or ''}"
-            for l in self.state["locks"].values():
-                if l["owner"] == pid:
-                    continue
-                if paths_conflict(l["path"], path) and \
-                        (l["path"] != path or region_overlap(l["region"], region)):
-                    raise BusError(
-                        409,
-                        f"锁冲突：{l['path']}"
-                        + (f"({l['region']})" if l["region"] else "")
-                        + f" 正被 {l['owner_name']}(rank{l['owner_rank']}) 持有"
-                        + (f"：{l['note']}" if l.get("note") else ""))
             self.state["locks"][key] = {
                 "key": key, "path": path, "region": region,
                 "owner": pid, "owner_name": me["name"], "owner_rank": me["rank"],
                 "note": note or "", "since": now(),
+                "lease": lease, "expires": now() + lease,
             }
+            self._emit("lock.acquired", path=path, region=region,
+                       owner=me["name"], lease=lease)
             self.save()
+            return {"waiting": False}
+
+    def _clear_pending(self, hid):
+        for l in self.state["locks"].values():
+            if l.get("pending") == hid:
+                del l["pending"]
 
     def unlock(self, pid, path, region, force):
         path = norm_path(path)
@@ -206,6 +280,9 @@ class Bus:
             l = self.state["locks"].get(key)
             if not l:
                 raise BusError(404, f"没有找到锁：{key}")
+            if l.get("pending"):
+                raise BusError(409, f"该锁包含在交接 {l['pending']} 中，"
+                                    f"等待对方 accept，或 `bus reject {l['pending']}` 取消交接")
             if l["owner"] != pid:
                 if not force:
                     raise BusError(403, f"锁属于 {l['owner_name']}，确认后加 --force 强制解锁")
@@ -215,17 +292,57 @@ class Bus:
                 is_host = host is not None and host["id"] == pid
                 if not (owner_dead or me["rank"] < l["owner_rank"] or is_host):
                     raise BusError(403, "权限不足：只有更高权限者、当前主机、或对方掉线后才能强制解锁")
+                self._emit("lock.force_released", path=l["path"], region=l["region"],
+                           owner=l["owner_name"], actor=me["name"])
+            else:
+                self._emit("lock.released", path=l["path"], region=l["region"],
+                           owner=me["name"])
             del self.state["locks"][key]
+            self._grant_waiters()
             self.save()
 
     def unlock_all(self, pid):
         self.get_peer(pid)
         with self.mu:
-            mine = [k for k, l in self.state["locks"].items() if l["owner"] == pid]
+            mine = [k for k, l in self.state["locks"].items()
+                    if l["owner"] == pid and not l.get("pending")]
+            skipped = sum(1 for l in self.state["locks"].values()
+                          if l["owner"] == pid and l.get("pending"))
             for k in mine:
-                del self.state["locks"][k]
+                l = self.state["locks"].pop(k)
+                self._emit("lock.released", path=l["path"], region=l["region"],
+                           owner=l["owner_name"])
+            if mine:
+                self._grant_waiters()
             self.save()
-            return len(mine)
+            return len(mine), skipped
+
+    def _grant_waiters(self):
+        """有锁释放后，按排队顺序授予现在能拿到的 waiter（调用方须持锁）。"""
+        for w in list(self.state["waiters"]):
+            p = self.state["peers"].get(w["peer"])
+            if not p or not self.alive(p):
+                self.state["waiters"].remove(w)
+                continue
+            if self._find_conflict(w["peer"], w["path"], w["region"]):
+                continue
+            self.state["waiters"].remove(w)
+            key = f"{w['path']}|{w['region'] or ''}"
+            self.state["locks"][key] = {
+                "key": key, "path": w["path"], "region": w["region"],
+                "owner": w["peer"], "owner_name": w["peer_name"],
+                "owner_rank": p["rank"], "note": w["note"], "since": now(),
+                "lease": LOCK_LEASE, "expires": now() + LOCK_LEASE,
+            }
+            self.state["msg_seq"] += 1
+            self.state["inbox"].setdefault(w["peer"], []).append({
+                "id": self.state["msg_seq"], "from": "bus", "from_name": "总线",
+                "body": f"✅ 你排队等待的锁已获得：{w['path']}"
+                        + (f"({w['region']})" if w["region"] else ""),
+                "thread": None, "blocking": False, "ts": now(), "read": False,
+            })
+            self._emit("lock.acquired", path=w["path"], region=w["region"],
+                       owner=w["peer_name"], via="wait")
 
     # ---- 消息 ----
 
@@ -265,15 +382,42 @@ class Bus:
                      f"请你阅读全过程后用 `bus decide {th['id']} \"最终方案\"` 总结定案。"),
             "thread": th["id"], "blocking": True, "ts": now(), "read": False,
         })
+        self._emit("thread.escalated", thread=th["id"], topic=th["topic"])
 
     def sweep(self):
-        """惰性巡检：超时的阻塞私聊转入待裁决。每次请求时调用。"""
+        """惰性巡检：超时私聊转裁决、到期锁释放、死 waiter 清理、交接过期。每次请求时调用。"""
         with self.mu:
             changed = False
             for th in self.state["threads"].values():
                 if th.get("blocking") and th["status"] == "open" \
                         and th.get("deadline") and now() > th["deadline"]:
                     self._escalate(th)
+                    changed = True
+            expired = [k for k, l in self.state["locks"].items()
+                       if l.get("expires") and now() > l["expires"]]
+            for k in expired:
+                l = self.state["locks"].pop(k)
+                self._emit("lock.expired", path=l["path"], region=l["region"],
+                           owner=l["owner_name"])
+                changed = True
+            if expired:
+                self._grant_waiters()
+            before = len(self.state["waiters"])
+            self.state["waiters"] = [
+                w for w in self.state["waiters"]
+                if w["peer"] in self.state["peers"]
+                and self.alive(self.state["peers"][w["peer"]])]
+            if len(self.state["waiters"]) != before:
+                changed = True
+            for h in self.state["handoffs"].values():
+                if h["status"] == "offered" and h.get("expires") and now() > h["expires"]:
+                    h["status"] = "expired"
+                    c = self.state["claims"].get(h["claim"])
+                    if c and c["status"] == "handing_off":
+                        c["status"] = "working"
+                        c["updated"] = now()
+                    self._clear_pending(h["id"])
+                    self._emit("handoff.expired", id=h["id"], claim=h["claim"])
                     changed = True
             if changed:
                 self.save()
@@ -289,6 +433,7 @@ class Bus:
                     "id": self.state["msg_seq"], "from": pid,
                     "from_name": me["name"], "body": body, "ts": now(),
                 })
+                self._emit("msg.public", **{"from": me["name"], "body": body[:80]})
                 self.save()
                 return {"kind": "public"}
             target = self.peer_by_name(to)
@@ -308,6 +453,9 @@ class Bus:
             }
             self.state["threads"][tid] = th
             self._append_msg(th, me, body, notify_pid=target["id"])
+            self._emit("thread.created", thread=tid, topic=th["topic"],
+                       **{"from": me["name"], "to": target["name"],
+                          "blocking": bool(blocking)})
             self.save()
             return {"kind": "dm", "thread": tid}
 
@@ -326,6 +474,8 @@ class Bus:
                 if th["rounds_left"] <= 0:
                     self._escalate(th)
                     note = "回合已尽，转入裁决：等待高权限方 decide"
+            self._emit("thread.replied", thread=tid, actor=me["name"],
+                       rounds_left=th["rounds_left"])
             self.save()
             return {"thread": tid, "rounds_left": th["rounds_left"],
                     "status": th["status"], "note": note}
@@ -352,6 +502,8 @@ class Bus:
                            for p in th["parties"])
         self._board_append("决策记录",
                            f"- {icon} **{th['topic']}**（{names}，{label}，{fmt_time()}）：{summary}")
+        self._emit("thread." + verdict, thread=th["id"], topic=th["topic"],
+                   by=me["name"], summary=summary)
 
     def resolve(self, pid, tid, summary):
         self.get_peer(pid)
@@ -381,6 +533,270 @@ class Bus:
             self._finish_thread(th, pid, summary, "decided")
             self.save()
 
+    # ---- Claim：工作声明（运行时归属，不做任务管理）----
+
+    def claim(self, pid, name, note, scope, status, waiting_on):
+        me = self.get_peer(pid)
+        if status and status not in self.CLAIM_STATUSES:
+            raise BusError(400, f"status 须为 {'/'.join(self.CLAIM_STATUSES)}")
+        with self.mu:
+            c = self.state["claims"].get(name)
+            if c:
+                if c["owner"] != pid:
+                    raise BusError(409, f"「{name}」已被 {c['owner_name']} 声明"
+                                        f"（{c['status']}）。协调用私聊，掉线接管用 bus takeover")
+                if note is not None:
+                    c["note"] = note
+                if scope is not None:
+                    c["scope"] = scope
+                if status:
+                    c["status"] = status
+                if waiting_on is not None:
+                    c["waiting_on"] = waiting_on
+                c["updated"] = now()
+                self._emit("claim.updated", claim=name, actor=me["name"],
+                           status=c["status"])
+            else:
+                c = {"name": name, "owner": pid, "owner_name": me["name"],
+                     "owner_rank": me["rank"], "note": note or "",
+                     "scope": scope or "", "status": status or "claimed",
+                     "waiting_on": waiting_on or "",
+                     "created": now(), "updated": now()}
+                self.state["claims"][name] = c
+                self._emit("claim.created", claim=name, actor=me["name"],
+                           note=note or "", scope=scope or "")
+            self.save()
+            return c
+
+    def unclaim(self, pid, name, status):
+        me = self.get_peer(pid)
+        if status not in ("done", "abandoned"):
+            raise BusError(400, "status 须为 done 或 abandoned")
+        with self.mu:
+            c = self.state["claims"].get(name)
+            if not c:
+                raise BusError(404, f"claim 不存在：{name}")
+            host = self.host_peer()
+            if c["owner"] != pid and not (host and host["id"] == pid):
+                raise BusError(403, "只有 owner 或当前主机可以关闭 claim")
+            c["status"] = status
+            c["updated"] = now()
+            self._emit("claim.closed", claim=name, actor=me["name"], status=status)
+            self.save()
+
+    # ---- Handoff：两阶段交接 + 死后接管 ----
+
+    def _get_handoff(self, hid):
+        h = self.state["handoffs"].get(hid)
+        if not h:
+            raise BusError(404, f"未知交接：{hid}")
+        return h
+
+    def _notify(self, pid_to, from_id, from_name, body, blocking=False, thread=None):
+        self.state["msg_seq"] += 1
+        self.state["inbox"].setdefault(pid_to, []).append({
+            "id": self.state["msg_seq"], "from": from_id, "from_name": from_name,
+            "body": body, "thread": thread, "blocking": blocking,
+            "ts": now(), "read": False,
+        })
+
+    def handoff(self, pid, to, claim_name, goal, state_text, blockers,
+                next_action, git, wip_patch):
+        me = self.get_peer(pid)
+        with self.mu:
+            c = self.state["claims"].get(claim_name)
+            if not c:
+                raise BusError(404, f"claim 不存在：{claim_name}（先 bus claim {claim_name}）")
+            if c["owner"] != pid:
+                raise BusError(403, f"「{claim_name}」属于 {c['owner_name']}")
+            if c["status"] == "handing_off":
+                raise BusError(409, "已有进行中的交接，等对方 accept/reject 或先 reject 取消")
+            if not next_action:
+                raise BusError(400, "必须提供 --next：没有下一步的交接是甩锅")
+            target = None
+            if to and to != "anyone":
+                target = self.peer_by_name(to)
+                if not target:
+                    raise BusError(404, f"未知对象：{to}（用 bus peers 查看）")
+                if target["id"] == pid:
+                    raise BusError(400, "不能交接给自己")
+            my_locks = [l for l in self.state["locks"].values() if l["owner"] == pid]
+            self.state["handoff_seq"] += 1
+            hid = f"h{self.state['handoff_seq']}"
+            patch_file = None
+            if wip_patch:
+                patch_file = f"capsules/{hid}-wip.patch"
+                with open(os.path.join(self.dir, patch_file), "w", encoding="utf-8") as f:
+                    f.write(wip_patch)
+            capsule = {
+                "goal": goal or c["note"],
+                "current_state": state_text or "",
+                "blockers": blockers or [],
+                "next_action": next_action,
+                "locks": [lock_label(l) for l in my_locks],
+                "threads": [t["id"] for t in self.state["threads"].values()
+                            if pid in t["parties"] and t["status"] in ("open", "needs_decision")],
+                "changes": [ch["id"] for ch in self.state["changes"] if ch["peer"] == pid][-5:],
+                "git": git or {},
+                "wip_patch": patch_file,
+                "partial": False,
+            }
+            h = {"id": hid, "claim": claim_name, "from": pid, "from_name": me["name"],
+                 "to": target["id"] if target else None,
+                 "to_name": target["name"] if target else "任何人",
+                 "status": "offered", "created": now(), "expires": now() + HANDOFF_TTL,
+                 "capsule": capsule}
+            self.state["handoffs"][hid] = h
+            c["status"] = "handing_off"
+            c["updated"] = now()
+            for l in my_locks:
+                l["pending"] = hid
+            if target:
+                self._notify(target["id"], pid, me["name"],
+                             f"🤝 {me['name']} 向你交接「{claim_name}」："
+                             f"`bus capsule {hid}` 看详情，`bus accept {hid}` 接收 / "
+                             f"`bus reject {hid}` 拒绝（30 分钟有效）",
+                             blocking=True)
+            self._emit("handoff.offered", id=hid, claim=claim_name,
+                       **{"from": me["name"], "to": h["to_name"]})
+            self.save()
+            return h
+
+    def handoff_accept(self, pid, hid):
+        me = self.get_peer(pid)
+        with self.mu:
+            h = self._get_handoff(hid)  # 过期已由 sweep 处理
+            if h["status"] != "offered":
+                raise BusError(400, f"交接状态为 {h['status']}，不能接收")
+            if h["to"] and h["to"] != pid:
+                raise BusError(403, f"该交接指定给 {h['to_name']}")
+            c = self.state["claims"][h["claim"]]
+            c.update(owner=pid, owner_name=me["name"], owner_rank=me["rank"],
+                     status="working", updated=now())
+            transferred = []
+            for l in self.state["locks"].values():
+                if l.get("pending") == hid:
+                    l["owner"] = pid
+                    l["owner_name"] = me["name"]
+                    l["owner_rank"] = me["rank"]
+                    del l["pending"]
+                    l["expires"] = now() + l.get("lease", LOCK_LEASE)
+                    transferred.append(lock_label(l))
+            h["status"] = "accepted"
+            h["accepted_by"] = me["name"]
+            h["accepted_at"] = now()
+            self._notify(h["from"], pid, me["name"],
+                         f"✅ {me['name']} 接受了交接「{h['claim']}」"
+                         f"（转移 {len(transferred)} 个锁）")
+            self._emit("handoff.accepted", id=hid, claim=h["claim"], by=me["name"],
+                       locks=len(transferred))
+            self.save()
+            patch_text = None
+            pf = h["capsule"].get("wip_patch")
+            if pf:
+                full = os.path.join(self.dir, pf)
+                if os.path.exists(full):
+                    with open(full, encoding="utf-8") as f:
+                        patch_text = f.read()
+            return {"handoff": h, "transferred": transferred, "patch_text": patch_text}
+
+    def handoff_reject(self, pid, hid, reason):
+        me = self.get_peer(pid)
+        with self.mu:
+            h = self._get_handoff(hid)
+            if h["status"] != "offered":
+                raise BusError(400, f"交接状态为 {h['status']}")
+            if pid != h["from"] and h["to"] != pid:
+                raise BusError(403, "只有发起方（取消）或接收方（拒绝）可以操作")
+            h["status"] = "cancelled" if pid == h["from"] else "rejected"
+            h["reason"] = reason or ""
+            c = self.state["claims"].get(h["claim"])
+            if c and c["status"] == "handing_off":
+                c["status"] = "working"
+                c["updated"] = now()
+            self._clear_pending(hid)
+            other = h["to"] if pid == h["from"] else h["from"]
+            if other:
+                self._notify(other, pid, me["name"],
+                             f"✋ {me['name']} {'取消' if pid == h['from'] else '拒绝'}"
+                             f"了交接「{h['claim']}」" + (f"：{reason}" if reason else ""))
+            self._emit("handoff." + h["status"], id=hid, claim=h["claim"],
+                       actor=me["name"], reason=reason or "")
+            self.save()
+
+    def takeover(self, pid, claim_name, reason):
+        """被动接管：owner 掉线（或权限更高）时，从事故现场合成 salvage capsule。"""
+        me = self.get_peer(pid)
+        with self.mu:
+            c = self.state["claims"].get(claim_name)
+            if not c:
+                raise BusError(404, f"claim 不存在：{claim_name}")
+            if c["owner"] == pid:
+                raise BusError(400, f"「{claim_name}」已经是你的")
+            owner = self.state["peers"].get(c["owner"])
+            owner_alive = bool(owner) and self.alive(owner)
+            if owner_alive:
+                if me["rank"] > c["owner_rank"]:
+                    raise BusError(403, f"{c['owner_name']} 仍在线且权限不低于你。"
+                                        "先私聊协商，或请对方 bus handoff")
+            else:
+                host = self.host_peer()
+                dead_for = now() - (owner["last_seen"] if owner else 1e18)
+                if not (me["rank"] < c["owner_rank"]
+                        or (host and host["id"] == pid)
+                        or dead_for > 2 * TTL):
+                    raise BusError(403, "对方掉线时间尚短：需更高权限者或当前主机接管；"
+                                        "掉线超 20 分钟后任何人可接管")
+            # 取消该 claim 上未决的交接
+            for h in self.state["handoffs"].values():
+                if h["status"] == "offered" and h["claim"] == claim_name:
+                    h["status"] = "cancelled"
+                    self._clear_pending(h["id"])
+            owner_locks = [l for l in self.state["locks"].values()
+                           if l["owner"] == c["owner"]]
+            if owner_alive:
+                salvage_note = "该接管为高权限强制接管，原负责人仍在线、未参与交接"
+                salvage_next = "先与原负责人核对现场，避免覆盖其未提交改动"
+            else:
+                salvage_note = "原负责人掉线，其未提交改动与脑中上下文可能已丢失"
+                salvage_next = "先 git log / git status 核对代码现场，再继续"
+            salvage = {
+                "goal": c["note"],
+                "current_state": "（事故现场重建，非本人主动交接）",
+                "blockers": [salvage_note],
+                "next_action": salvage_next,
+                "locks": [lock_label(l) for l in owner_locks],
+                "threads": [t["id"] for t in self.state["threads"].values()
+                            if c["owner"] in t["parties"]
+                            and t["status"] in ("open", "needs_decision")],
+                "changes": [ch["id"] for ch in self.state["changes"]
+                            if ch["peer"] == c["owner"]][-5:],
+                "git": {}, "wip_patch": None, "partial": True,
+            }
+            self.state["handoff_seq"] += 1
+            hid = f"h{self.state['handoff_seq']}"
+            h = {"id": hid, "claim": claim_name, "from": c["owner"],
+                 "from_name": c["owner_name"], "to": pid, "to_name": me["name"],
+                 "status": "taken_over", "created": now(), "expires": None,
+                 "capsule": salvage, "reason": reason or ""}
+            self.state["handoffs"][hid] = h
+            transferred = []
+            for l in owner_locks:
+                l["owner"] = pid
+                l["owner_name"] = me["name"]
+                l["owner_rank"] = me["rank"]
+                l.pop("pending", None)
+                l["expires"] = now() + l.get("lease", LOCK_LEASE)
+                transferred.append(lock_label(l))
+            c.update(owner=pid, owner_name=me["name"], owner_rank=me["rank"],
+                     status="working", updated=now())
+            self._emit("work.taken_over", id=hid, claim=claim_name,
+                       **{"from": h["from_name"], "to": me["name"],
+                          "reason": reason or ""})
+            self.save()
+            return {"handoff": h, "transferred": transferred,
+                    "owner_alive": owner_alive}
+
     # ---- 改动历史 ----
 
     def done(self, pid, summary, files, commit, detail):
@@ -403,6 +819,8 @@ class Bus:
                 "files": files or [], "commit": commit,
                 "detail_file": detail_file, "ts": now(),
             })
+            self._emit("change.recorded", id=cid, actor=me["name"], summary=summary,
+                       files=files or [], commit=commit)
             self.save()
             return cid
 
@@ -426,10 +844,25 @@ class Bus:
             f.write("\n".join(lines) + "\n")
 
     def board_append(self, pid, section, text):
-        self.get_peer(pid)
+        me = self.get_peer(pid)
         with self.mu:
             self._board_append(section, text)
+            self._emit("board.appended", actor=me["name"], section=section)
             self.save()
+
+    def heartbeat(self, pid):
+        """轻量心跳：续期/保活 + 返回待办计数，不标记已读（供 hook 自动调用）。"""
+        self.sweep()
+        self.get_peer(pid)
+        with self.mu:
+            inbox = self.state["inbox"].get(pid, [])
+            ub = sum(1 for m in inbox if not m["read"] and m["blocking"])
+            un = sum(1 for m in inbox if not m["read"] and not m["blocking"])
+            offers = sum(1 for h in self.state["handoffs"].values()
+                         if h["status"] == "offered" and h["to"] in (None, pid))
+            self.save()
+            return {"unread_blocking": ub, "unread_normal": un,
+                    "handoff_offers": offers}
 
     def board_read(self):
         with open(self.board_path, encoding="utf-8") as f:
@@ -448,6 +881,11 @@ class Bus:
                 "peers": peers,
                 "host": host["id"] if host else None,
                 "locks": list(self.state["locks"].values()),
+                "waiters": self.state["waiters"],
+                "claims": list(self.state["claims"].values()),
+                "handoffs": [{k: h.get(k) for k in
+                              ("id", "claim", "from_name", "to_name", "status", "created")}
+                             for h in self.state["handoffs"].values()],
                 "changes": self.state["changes"][-50:],
                 "public": self.state["public"][-50:],
                 "threads": [{k: t[k] for k in
@@ -459,8 +897,27 @@ class Bus:
     def thread_view(self, tid):
         return self._thread(tid)
 
+    def handoff_view(self, hid):
+        return self._get_handoff(hid)
+
+    def events_view(self, n, etype):
+        if not os.path.exists(self.events_path):
+            return []
+        with open(self.events_path, encoding="utf-8") as f:
+            lines = f.readlines()
+        out = []
+        for line in lines[-2000:]:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if etype and not ev.get("type", "").startswith(etype):
+                continue
+            out.append(ev)
+        return out[-n:]
+
     def sync_view(self, pid):
-        """收尾/开场仪式：心跳 + 新公聊 + 新改动 + 未读私聊（阻塞优先）+ 待办线程。"""
+        """收尾/开场仪式：心跳 + 新公聊 + 新改动 + 未读私聊（阻塞优先）+ 交接 + claims。"""
         self.sweep()
         me = self.get_peer(pid)
         with self.mu:
@@ -485,6 +942,12 @@ class Bus:
 
             my_threads = [enrich(t) for t in self.state["threads"].values()
                           if pid in t["parties"] and t["status"] in ("open", "needs_decision")]
+            offers = [{"id": h["id"], "claim": h["claim"], "from_name": h["from_name"],
+                       "capsule": h["capsule"]}
+                      for h in self.state["handoffs"].values()
+                      if h["status"] == "offered" and h["to"] in (None, pid)]
+            active_claims = [c for c in self.state["claims"].values()
+                             if c["status"] not in ("done", "abandoned")]
             peers = [{"name": p["name"], "rank": p["rank"], "alive": self.alive(p),
                       "host": p["host"], "cli": p["cli"]}
                      for p in sorted(self.state["peers"].values(), key=lambda x: x["rank"])]
@@ -500,6 +963,8 @@ class Bus:
                 "unread_blocking": [m for m in unread if m["blocking"]],
                 "unread_normal": [m for m in unread if not m["blocking"]],
                 "my_open_threads": my_threads,
+                "handoff_offers": offers,
+                "active_claims": active_claims,
             }
 
 
@@ -546,14 +1011,36 @@ def make_handler(bus):
                     n = bus.leave(b["peer"])
                     return self._send(200, {"ok": True, "released_locks": n})
                 if method == "POST" and path == "/api/lock":
-                    bus.lock(b["peer"], b["path"], b.get("region"), b.get("note"))
-                    return self._send(200, {"ok": True})
+                    return self._send(200, bus.lock(
+                        b["peer"], b["path"], b.get("region"), b.get("note"),
+                        b.get("ttl_min"), b.get("wait")))
                 if method == "POST" and path == "/api/unlock":
                     if b.get("all"):
-                        n = bus.unlock_all(b["peer"])
-                        return self._send(200, {"ok": True, "released": n})
+                        n, skipped = bus.unlock_all(b["peer"])
+                        return self._send(200, {"ok": True, "released": n,
+                                                "skipped_pending": skipped})
                     bus.unlock(b["peer"], b["path"], b.get("region"), b.get("force"))
                     return self._send(200, {"ok": True})
+                if method == "POST" and path == "/api/claim":
+                    return self._send(200, {"claim": bus.claim(
+                        b["peer"], b["name"], b.get("note"), b.get("scope"),
+                        b.get("status"), b.get("waiting_on"))})
+                if method == "POST" and path == "/api/unclaim":
+                    bus.unclaim(b["peer"], b["name"], b.get("status") or "done")
+                    return self._send(200, {"ok": True})
+                if method == "POST" and path == "/api/handoff":
+                    return self._send(200, {"handoff": bus.handoff(
+                        b["peer"], b.get("to"), b["claim"], b.get("goal"),
+                        b.get("state"), b.get("blockers"), b.get("next"),
+                        b.get("git"), b.get("wip_patch"))})
+                if method == "POST" and path == "/api/accept":
+                    return self._send(200, bus.handoff_accept(b["peer"], b["id"]))
+                if method == "POST" and path == "/api/reject":
+                    bus.handoff_reject(b["peer"], b["id"], b.get("reason"))
+                    return self._send(200, {"ok": True})
+                if method == "POST" and path == "/api/takeover":
+                    return self._send(200, bus.takeover(
+                        b["peer"], b["claim"], b.get("reason")))
                 if method == "POST" and path == "/api/say":
                     return self._send(200, bus.say(
                         b["peer"], b["to"], b["body"], b.get("blocking"),
@@ -573,12 +1060,19 @@ def make_handler(bus):
                 if method == "POST" and path == "/api/board":
                     bus.board_append(b["peer"], b["section"], b["text"])
                     return self._send(200, {"ok": True})
+                if method == "POST" and path == "/api/heartbeat":
+                    return self._send(200, bus.heartbeat(b["peer"]))
                 if method == "GET" and path == "/api/sync":
                     return self._send(200, bus.sync_view(q["peer"][0]))
                 if method == "GET" and path == "/api/status":
                     return self._send(200, bus.status_view())
                 if method == "GET" and path == "/api/thread":
                     return self._send(200, bus.thread_view(q["id"][0]))
+                if method == "GET" and path == "/api/handoff":
+                    return self._send(200, bus.handoff_view(q["id"][0]))
+                if method == "GET" and path == "/api/events":
+                    return self._send(200, {"events": bus.events_view(
+                        int(q.get("n", ["30"])[0]), q.get("type", [None])[0])})
                 if method == "GET" and path == "/api/board":
                     return self._send(200, {"board": bus.board_read()})
                 return self._send(404, {"error": f"未知路由: {method} {path}"})
@@ -601,15 +1095,49 @@ def guess_ip():
         return "127.0.0.1"
 
 
+def tailscale_ip():
+    """本机 Tailscale IPv4（100.64.0.0/10）；未安装/未运行返回 None。"""
+    import shutil
+    ts = shutil.which("tailscale")
+    if not ts:
+        return None
+    try:
+        r = subprocess.run([ts, "ip", "-4"], capture_output=True, text=True, timeout=5)
+        ip = (r.stdout.strip().splitlines() or [""])[0]
+        return ip if r.returncode == 0 and ip.startswith("100.") else None
+    except Exception:
+        return None
+
+
 def cmd_serve(args):
     bus = Bus(args.dir)
-    ip = args.host or guess_ip()
-    hub_url = f"http://{ip}:{args.port}#{bus.token}"
+    lan_ip = guess_ip()
+    ts_ip = tailscale_ip()
+    # 广告地址优先级：--host 显式指定 > Tailscale（跨网络可达且加密）> 局域网
+    primary = args.host or ts_ip or lan_ip
+    urls = []
+    for ip in (primary, ts_ip, lan_ip, "127.0.0.1"):
+        if ip:
+            u = f"http://{ip}:{args.port}"
+            if u not in urls:
+                urls.append(u)
     with open(os.path.join(bus.dir, "hub.json"), "w", encoding="utf-8") as f:
-        json.dump({"url": f"http://{ip}:{args.port}", "token": bus.token}, f)
-    print(f"agent-bus hub 已启动（数据目录: {bus.dir}）")
-    print(f"其他端加入方式： bus join --hub '{hub_url}'")
-    print(f"（若 {args.dir} 随项目 git 同步，对端也可直接 bus join 自动发现）")
+        json.dump({"url": urls[0], "alt_urls": urls[1:], "token": bus.token}, f)
+    print(f"agent-bus hub v{VERSION} 已启动（数据目录: {bus.dir}）")
+    for i, u in enumerate(urls):
+        tag = ""
+        if ts_ip and ts_ip in u:
+            tag = "（Tailscale，推荐跨网络使用）"
+        elif lan_ip and lan_ip in u:
+            tag = "（局域网）"
+        elif "127.0.0.1" in u:
+            tag = "（仅本机）"
+        mark = "★" if i == 0 else " "
+        print(f" {mark} bus join --hub '{u}#{bus.token}'  {tag}")
+    if not ts_ip:
+        print("  提示：未检测到 Tailscale。多机跨网络协作建议安装（https://tailscale.com），"
+              "装好后重启 serve 即自动广告 Tailscale 地址，零额外配置。")
+    print(f"（若 {args.dir} 随项目 git 同步，对端也可直接 bus join 自动发现+自动选路）")
     httpd = ThreadingHTTPServer(("", args.port), make_handler(bus))
     try:
         httpd.serve_forever()
@@ -652,7 +1180,8 @@ def load_conf():
         return json.load(f)
 
 
-def api(conf, method, path, payload=None):
+def api_soft(conf, method, path, payload=None, timeout=15):
+    """返回 (ok, result)；失败不退出，供 hook 等需要 fail-open 的场景。"""
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(
         conf["hub"] + path, data=data, method=method,
@@ -661,16 +1190,23 @@ def api(conf, method, path, payload=None):
     # hub 通常是本机/局域网地址，绕过系统代理（macOS 上 urllib 会读系统代理设置）
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(req, timeout=15) as r:
-            return json.loads(r.read().decode("utf-8"))
+        with opener.open(req, timeout=timeout) as r:
+            return True, json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         try:
             msg = json.loads(e.read().decode("utf-8")).get("error")
         except Exception:
             msg = str(e)
-        die(msg)
-    except urllib.error.URLError as e:
-        die(f"连不上 hub（{conf['hub']}）：{e.reason}")
+        return False, {"error": msg}
+    except Exception as e:
+        return False, {"error": f"连不上 hub（{conf['hub']}）：{e}"}
+
+
+def api(conf, method, path, payload=None):
+    ok, r = api_soft(conf, method, path, payload)
+    if not ok:
+        die(r["error"])
+    return r
 
 
 def parse_hub(s):
@@ -679,6 +1215,40 @@ def parse_hub(s):
         url, token = s.rsplit("#", 1)
         return url.rstrip("/"), token
     die("--hub 格式应为 http://host:port#token")
+
+
+def git_run(*a):
+    try:
+        r = subprocess.run(["git", *a], capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def git_head():
+    return git_run("rev-parse", "--short", "HEAD")
+
+
+def git_info():
+    head = git_head()
+    if not head:
+        return {}
+    return {"branch": git_run("rev-parse", "--abbrev-ref", "HEAD"),
+            "head": head,
+            "dirty": bool(git_run("status", "--porcelain"))}
+
+
+def probe_hub(url, timeout=2):
+    """探测 hub 可达性：收到任何 HTTP 响应（含 401）即视为可达。"""
+    req = urllib.request.Request(url.rstrip("/") + "/api/status", method="GET")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=timeout):
+            return True
+    except urllib.error.HTTPError:
+        return True  # 401 = 服务在线
+    except Exception:
+        return False
 
 
 def cmd_join(args):
@@ -690,7 +1260,19 @@ def cmd_join(args):
             die("缺少 --hub，且本地 .bus/hub.json 不存在（先 git pull 或向主机要 hub 地址）")
         with open(hj, encoding="utf-8") as f:
             c = json.load(f)
-        url, token = c["url"], c["token"]
+        token = c["token"]
+        # 自动选路：逐个探测候选地址（含 Tailscale / 局域网备选）
+        candidates = [c["url"]] + c.get("alt_urls", [])
+        url = None
+        for cand in candidates:
+            if probe_hub(cand):
+                url = cand
+                break
+        if not url:
+            die("hub.json 里的地址都不可达：\n  " + "\n  ".join(candidates)
+                + "\n检查网络/Tailscale，或用 --hub 手动指定")
+        if url != c["url"]:
+            print(f"  （自动选路：主地址不可达，改用 {url}）")
     host = socket.gethostname()
     name = args.name or f"{host}-{os.path.basename(os.getcwd())}"
     r = api({"hub": url, "token": token}, "POST", "/api/join",
@@ -702,7 +1284,7 @@ def cmd_join(args):
                    "name": p["name"], "rank": p["rank"]}, f, ensure_ascii=False, indent=1)
     role = "主机（rank 0，权限最高）" if p["rank"] == 0 else f"rank {p['rank']}"
     print(f"✓ 已加入总线：{p['name']}，{role}，身份写入 {path}")
-    print("  下一步：bus sync 查看公聊、改动和私聊")
+    print("  下一步：bus sync 查看公聊、改动、私聊与交接")
 
 
 def cmd_sync(args):
@@ -732,15 +1314,22 @@ def cmd_sync(args):
             print(f"  [{fmt_time(m['ts'])}] {m['from_name']}: {m['body']}")
 
     if v["unread_blocking"]:
-        print(f"\n-- ⚠️ 阻塞私聊 ({len(v['unread_blocking'])})，必须处理 --")
+        print(f"\n-- ⚠️ 阻塞私聊/交接 ({len(v['unread_blocking'])})，必须处理 --")
         for m in v["unread_blocking"]:
-            print(f"  [{m['thread']}] {m['from_name']}: {m['body']}")
-        print("  → 用 bus thread <id> 看全文，bus reply/resolve/decide 处理")
+            print(f"  [{m.get('thread') or '-'}] {m['from_name']}: {m['body']}")
+        print("  → bus thread <id> 看私聊全文；bus capsule <id> 看交接详情")
 
     if v["unread_normal"]:
-        print(f"\n-- 私聊 ({len(v['unread_normal'])}) --")
+        print(f"\n-- 私聊/通知 ({len(v['unread_normal'])}) --")
         for m in v["unread_normal"]:
-            print(f"  [{m['thread']}] {m['from_name']}: {m['body']}")
+            print(f"  [{m.get('thread') or '-'}] {m['from_name']}: {m['body']}")
+
+    if v.get("handoff_offers"):
+        print(f"\n-- 🤝 待接收交接 ({len(v['handoff_offers'])}) --")
+        for o in v["handoff_offers"]:
+            print(f"  [{o['id']}] {o['from_name']} → 你：「{o['claim']}」"
+                  f"  目标: {o['capsule'].get('goal') or '-'}")
+            print(f"      bus accept {o['id']} 接收 / bus reject {o['id']} 拒绝")
 
     if v["my_open_threads"]:
         print("\n-- 我参与的进行中私聊 --")
@@ -753,15 +1342,23 @@ def cmd_sync(args):
                 extra = f"，剩 {t['rounds_left']} 回合"
             print(f"  [{t['id']}] {t['topic']}（{tag}，{' ↔ '.join(t['parties'])}{extra}）")
 
+    if v.get("active_claims"):
+        print(f"\n-- 工作声明 ({len(v['active_claims'])}) --")
+        for c in v["active_claims"]:
+            w = f"，等待 {c['waiting_on']}" if c.get("waiting_on") else ""
+            s = f"，scope {c['scope']}" if c.get("scope") else ""
+            mine = "（我）" if c["owner"] == me["id"] else ""
+            print(f"  {c['name']} [{c['status']}] ← {c['owner_name']}{mine}{s}{w}")
+
     if v["locks"]:
         print(f"\n-- 当前锁 ({len(v['locks'])}) --")
         for l in v["locks"]:
-            r = f"({l['region']})" if l["region"] else ""
             n = f" — {l['note']}" if l.get("note") else ""
-            print(f"  {l['path']}{r} ← {l['owner_name']}{n}")
+            pend = f" [交接 {l['pending']} 中]" if l.get("pending") else ""
+            print(f"  {lock_label(l)} ← {l['owner_name']}{n}{pend}")
 
     if not any([v["new_changes"], v["new_public"], v["unread_blocking"],
-                v["unread_normal"], v["my_open_threads"]]):
+                v["unread_normal"], v["my_open_threads"], v.get("handoff_offers")]):
         print("  没有新消息。")
 
 
@@ -773,10 +1370,23 @@ def cmd_status(args):
         mark = "👑" if p["id"] == v["host"] else " "
         state = "在线" if p["alive"] else "掉线"
         print(f" {mark} rank{p['rank']}  {p['name']}  ({p['host']}/{p['cli']})  {state}")
+    print(f"-- 工作声明 ({len(v['claims'])}) --")
+    for c in v["claims"]:
+        w = f"，等待 {c['waiting_on']}" if c.get("waiting_on") else ""
+        print(f"  {c['name']} [{c['status']}] ← {c['owner_name']}{w}")
     print(f"-- 锁 ({len(v['locks'])}) --")
     for l in v["locks"]:
-        r = f"({l['region']})" if l["region"] else ""
-        print(f"  {l['path']}{r} ← {l['owner_name']}  {l.get('note', '')}")
+        pend = f" [交接 {l['pending']} 中]" if l.get("pending") else ""
+        print(f"  {lock_label(l)} ← {l['owner_name']}  {l.get('note', '')}{pend}")
+    if v.get("waiters"):
+        print(f"-- 锁等待队列 ({len(v['waiters'])}) --")
+        for w in v["waiters"]:
+            print(f"  {w['peer_name']} 等 {w['path']}"
+                  + (f"({w['region']})" if w.get("region") else ""))
+    if v.get("handoffs"):
+        print(f"-- 交接 ({len(v['handoffs'])}) --")
+        for h in v["handoffs"]:
+            print(f"  [{h['id']}] {h['claim']}  {h['from_name']} → {h['to_name']}  {h['status']}")
     print(f"-- 私聊线程 ({len(v['threads'])}) --")
     for t in v["threads"]:
         print(f"  [{t['id']}] {t['topic']}  {t['status']}")
@@ -784,17 +1394,26 @@ def cmd_status(args):
 
 def cmd_lock(args):
     conf = load_conf()
-    api(conf, "POST", "/api/lock", {"peer": conf["peer_id"], "path": args.path,
-                                    "region": args.region, "note": args.note})
-    r = f"({args.region})" if args.region else ""
-    print(f"✓ 已锁 {norm_path(args.path)}{r}")
+    r = api(conf, "POST", "/api/lock",
+            {"peer": conf["peer_id"], "path": args.path, "region": args.region,
+             "note": args.note, "ttl_min": args.ttl, "wait": args.wait})
+    label = norm_path(args.path) + (f"({args.region})" if args.region else "")
+    if r.get("waiting"):
+        print(f"⏳ {label} 被 {r['holder']} 持有，你已排队（第 {r['position']} 位），"
+              "释放后自动获得并通知你")
+    else:
+        ttl = f"，租约 {args.ttl} 分钟" if args.ttl else ""
+        print(f"✓ 已锁 {label}{ttl}")
 
 
 def cmd_unlock(args):
     conf = load_conf()
     if args.all:
         r = api(conf, "POST", "/api/unlock", {"peer": conf["peer_id"], "all": True})
-        print(f"✓ 已释放 {r['released']} 个锁")
+        msg = f"✓ 已释放 {r['released']} 个锁"
+        if r.get("skipped_pending"):
+            msg += f"（{r['skipped_pending']} 个在交接中，未释放）"
+        print(msg)
         return
     if not args.path:
         die("需要路径，或 --all")
@@ -808,20 +1427,138 @@ def cmd_locks(args):
     v = api(conf, "GET", "/api/status")
     if not v["locks"]:
         print("当前没有锁。")
-        return
     for l in v["locks"]:
-        r = f"({l['region']})" if l["region"] else ""
         n = f" — {l['note']}" if l.get("note") else ""
-        print(f"  {l['path']}{r} ← {l['owner_name']}(rank{l['owner_rank']}){n}")
+        pend = f" [交接 {l['pending']} 中]" if l.get("pending") else ""
+        print(f"  {lock_label(l)} ← {l['owner_name']}(rank{l['owner_rank']}){n}{pend}")
+    if v.get("waiters"):
+        print("等待队列：")
+        for w in v["waiters"]:
+            print(f"  {w['peer_name']} 等 {w['path']}"
+                  + (f"({w['region']})" if w.get("region") else ""))
 
 
-def git_head():
-    try:
-        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
-                             capture_output=True, text=True, timeout=5)
-        return out.stdout.strip() or None
-    except Exception:
-        return None
+def cmd_claim(args):
+    conf = load_conf()
+    r = api(conf, "POST", "/api/claim",
+            {"peer": conf["peer_id"], "name": args.name, "note": args.note,
+             "scope": args.scope, "status": args.status,
+             "waiting_on": args.waiting_on})
+    c = r["claim"]
+    print(f"✓ 「{c['name']}」 owner={c['owner_name']} status={c['status']}"
+          + (f" scope={c['scope']}" if c.get("scope") else "")
+          + (f" waiting_on={c['waiting_on']}" if c.get("waiting_on") else ""))
+
+
+def cmd_claims(args):
+    conf = load_conf()
+    v = api(conf, "GET", "/api/status")
+    claims = v["claims"] if args.all else \
+        [c for c in v["claims"] if c["status"] not in ("done", "abandoned")]
+    if not claims:
+        print("没有进行中的工作声明。")
+        return
+    for c in claims:
+        w = f"，等待 {c['waiting_on']}" if c.get("waiting_on") else ""
+        s = f"，scope {c['scope']}" if c.get("scope") else ""
+        n = f"\n      {c['note']}" if c.get("note") else ""
+        print(f"  {c['name']} [{c['status']}] ← {c['owner_name']}{s}{w}{n}")
+
+
+def cmd_unclaim(args):
+    conf = load_conf()
+    api(conf, "POST", "/api/unclaim",
+        {"peer": conf["peer_id"], "name": args.name,
+         "status": "abandoned" if args.abandoned else "done"})
+    print(f"✓ 「{args.name}」已关闭（{'abandoned' if args.abandoned else 'done'}）")
+
+
+def print_capsule(h):
+    cap = h["capsule"]
+    print(f"[{h['id']}] 「{h['claim']}」 {h['from_name']} → {h['to_name']}  状态 {h['status']}")
+    if cap.get("partial"):
+        print("  ⚠ 事故现场重建（partial），信息可能不全")
+    print(f"  目标: {cap.get('goal') or '-'}")
+    if cap.get("current_state"):
+        print(f"  现状: {cap['current_state']}")
+    for b in cap.get("blockers", []):
+        print(f"  ⚠ blocker: {b}")
+    print(f"  下一步: {cap.get('next_action') or '-'}")
+    if cap.get("locks"):
+        print(f"  锁: {', '.join(cap['locks'])}")
+    if cap.get("threads"):
+        print(f"  相关私聊: {', '.join(cap['threads'])}（bus thread <id> 查看）")
+    if cap.get("changes"):
+        print(f"  相关改动: {', '.join('#' + str(i) for i in cap['changes'])}（bus log 查看）")
+    g = cap.get("git") or {}
+    if g:
+        print(f"  git: {g.get('branch', '?')} @ {g.get('head', '?')}"
+              + ("（有未提交改动）" if g.get("dirty") else ""))
+
+
+def cmd_handoff(args):
+    conf = load_conf()
+    git = git_info()
+    patch = None
+    if git.get("dirty"):
+        if args.patch:
+            patch = git_run("diff", "HEAD") or ""
+            if not patch.strip():
+                git["dirty"] = False
+                patch = None
+        else:
+            die("工作区有未提交改动。先 commit，或加 --patch 将 diff 随交接携带")
+    r = api(conf, "POST", "/api/handoff",
+            {"peer": conf["peer_id"], "to": args.target, "claim": args.claim,
+             "goal": args.goal, "state": args.state,
+             "blockers": [b.strip() for b in args.blockers.split(",")] if args.blockers else [],
+             "next": args.next, "git": git, "wip_patch": patch})
+    h = r["handoff"]
+    print(f"✓ 交接 {h['id']} 已发出：「{h['claim']}」→ {h['to_name']}（30 分钟有效）")
+    print("  你的锁已打上交接标记，对方 accept 时原子转移；reject/超时自动解除")
+    if patch:
+        print("  已携带 wip patch，对方 accept 后可 git apply")
+
+
+def cmd_capsule(args):
+    conf = load_conf()
+    h = api(conf, "GET", f"/api/handoff?id={args.id}")
+    print_capsule(h)
+
+
+def cmd_accept(args):
+    conf = load_conf()
+    r = api(conf, "POST", "/api/accept", {"peer": conf["peer_id"], "id": args.id})
+    h = r["handoff"]
+    print(f"✓ 已接管「{h['claim']}」（来自 {h['from_name']}）")
+    print_capsule(h)
+    if r["transferred"]:
+        print(f"  ✓ 已转移锁: {', '.join(r['transferred'])}")
+    if r.get("patch_text"):
+        fn = f"{h['id']}-wip.patch"
+        with open(fn, "w", encoding="utf-8") as f:
+            f.write(r["patch_text"])
+        print(f"  ⚠ 有未提交改动补丁 → {fn}，审阅后执行 git apply {fn}")
+
+
+def cmd_reject(args):
+    conf = load_conf()
+    api(conf, "POST", "/api/reject",
+        {"peer": conf["peer_id"], "id": args.id,
+         "reason": " ".join(args.reason)})
+    print(f"✓ 已拒绝/取消交接 {args.id}，claim 与锁已还原")
+
+
+def cmd_takeover(args):
+    conf = load_conf()
+    r = api(conf, "POST", "/api/takeover",
+            {"peer": conf["peer_id"], "claim": args.claim, "reason": args.reason})
+    h = r["handoff"]
+    how = "仍在线（高权限强制接管）" if r.get("owner_alive") else "掉线"
+    print(f"✓ 已接管「{h['claim']}」（原 owner {h['from_name']} {how}）")
+    print_capsule(h)
+    if r["transferred"]:
+        print(f"  ✓ 已转移锁: {', '.join(r['transferred'])}")
 
 
 def cmd_done(args):
@@ -848,6 +1585,19 @@ def cmd_log(args):
         print(line)
         if c.get("files"):
             print(f"    文件: {', '.join(c['files'])}")
+
+
+def cmd_events(args):
+    conf = load_conf()
+    path = f"/api/events?n={args.n}" + (f"&type={args.type}" if args.type else "")
+    r = api(conf, "GET", path)
+    if not r["events"]:
+        print("没有匹配的事件。")
+        return
+    for ev in r["events"]:
+        detail = ", ".join(f"{k}={v}" for k, v in ev.items()
+                           if k not in ("seq", "ts", "type"))
+        print(f"  #{ev['seq']} [{fmt_time(ev['ts'])}] {ev['type']}  {detail}")
 
 
 def cmd_say(args):
@@ -937,7 +1687,358 @@ def cmd_peers(args):
 def cmd_leave(args):
     conf = load_conf()
     r = api(conf, "POST", "/api/leave", {"peer": conf["peer_id"]})
-    print(f"✓ 已离开总线，释放了 {r['released_locks']} 个锁")
+    print(f"✓ 已离开总线，释放了 {r['released_locks']} 个锁，未决交接已取消")
+
+
+# ==================== CLI hooks（自动锁 / 自动同步）====================
+#
+# 架构：业务逻辑只此一份（bus hook <cli>），各 CLI 只差一层薄适配：
+#   claude / kimi / codex —— 配置文件注册命令，stdin 收各家 JSON
+#   opencode / pi        —— 生成的 TS 胶水层把 payload 归一化后调 bus hook
+# 协议：exit 0 放行（stdout 可带提示），exit 2 拦截（stderr 为原因）。
+# hub 不可达默认 fail-open（放行），BUS_HOOK_ENFORCE=1 改为 fail-closed。
+
+WRITE_TOOL_RE = re.compile(r"edit|write|notebook|patch|replace|create", re.I)
+BASH_TOOL_RE = re.compile(r"bash|shell|exec|terminal|command", re.I)
+
+
+def hook_normalize(cli, p):
+    """把各 CLI 的 payload 归一化成 {event, tool, file_path, command, cwd}。"""
+    if cli in ("opencode", "pi"):
+        return p  # TS 胶水层已按此格式归一化
+    ev = p.get("hook_event_name") or ""
+    ti = p.get("tool_input") or {}
+    return {
+        "event": {"PreToolUse": "pre_tool_use", "Stop": "stop",
+                  "SessionHeartbeat": "heartbeat",
+                  "SessionStart": "session_start"}.get(ev, ev.lower() or None),
+        "tool": p.get("tool_name") or p.get("tool") or "",
+        "file_path": ti.get("file_path") or ti.get("filePath") or ti.get("path"),
+        "command": ti.get("command") or ti.get("cmd"),
+        "cwd": p.get("cwd"),
+    }
+
+
+def sniff_bash_writes(cmd):
+    """从 shell 命令里嗅探可能的写文件目标（尽力而为，允许漏判）。"""
+    targets = []
+    for m in re.finditer(r">>?\s*([^\s;&|<>]+)", cmd):
+        t = m.group(1)
+        if t not in ("1", "2", "&1", "&2") and not t.startswith("/dev/"):
+            targets.append(t)
+    for m in re.finditer(r"\btee\s+(?:-\w+\s+)*([^\s;&|]+)", cmd):
+        targets.append(m.group(1))
+    for m in re.finditer(r"\bsed\s+(?:-[a-zA-Z]+\s+)*-i\S*\s+(?:'[^']*'|\"[^\"]*\"|\S+)\s+([^\s;&|]+)", cmd):
+        targets.append(m.group(1))
+    return [t for t in targets if t and not t.startswith("-")]
+
+
+def rel_under(path, cwd):
+    """把 hook 收到的路径转成项目相对路径；在项目外返回 None。"""
+    base = cwd or os.getcwd()
+    ap = path if os.path.isabs(path) else os.path.join(base, path)
+    ap = os.path.normpath(ap)
+    try:
+        rel = os.path.relpath(ap, base)
+    except ValueError:
+        return None
+    if rel.startswith("..") or os.path.isabs(rel):
+        return None
+    if rel.startswith(".bus/") or rel.startswith(".bus-peer"):
+        return None
+    return norm_path(rel)
+
+
+def hook_block(cli, msg):
+    """按 CLI 协议拦截：exit 2 + stderr；codex 额外输出 JSON。"""
+    sys.stderr.write(msg + "\n")
+    if cli == "codex":
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "deny",
+            "permissionDecisionReason": msg}}, ensure_ascii=False))
+    sys.exit(2)
+
+
+def hook_check_lock(conf, cli, rel, auto_lock):
+    """rel 是项目相对路径；冲突时按协议拦截。auto_lock=True 时无冲突则自动加锁。"""
+    payload = {"peer": conf["peer_id"], "path": rel, "note": "auto(hook)"}
+    if not auto_lock:
+        # 只检查：与我无关的冲突锁存在即拦
+        ok, st = api_soft(conf, "GET", "/api/status")
+        if not ok:
+            return  # hub 不可达 → fail-open
+        for l in st.get("locks", []):
+            if l["owner"] == conf["peer_id"]:
+                continue
+            if paths_conflict(l["path"], rel) and \
+                    (l["path"] != rel or l.get("region") is None):
+                hook_block(cli, f"🔒 agent-bus: {lock_label(l)} 正被 {l['owner_name']} 持有"
+                                + (f"（{l['note']}）" if l.get("note") else "")
+                                + "。先 `bus locks` 查看，协调或用 `bus lock --wait` 排队。")
+        return
+    ok, r = api_soft(conf, "POST", "/api/lock", payload)
+    if not ok:
+        if "error" in r and "冲突" in str(r["error"]):
+            hook_block(cli, f"🔒 agent-bus: {r['error']}。可用 `bus lock {rel} --wait` 排队。")
+        if os.environ.get("BUS_HOOK_ENFORCE") == "1":
+            hook_block(cli, f"🔒 agent-bus: hub 不可达且 BUS_HOOK_ENFORCE=1，拒绝写入 {rel}")
+        # 默认 fail-open
+        sys.exit(0)
+    if r.get("waiting"):  # 理论上不传 wait 不会发生，防御
+        sys.exit(0)
+    sys.exit(0)
+
+
+def cmd_hook(args):
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        sys.exit(0)  # 解析失败 fail-open
+    info = hook_normalize(args.cli, payload)
+    ev = info.get("event")
+    try:
+        conf = load_conf()
+    except SystemExit:
+        sys.exit(0)  # 项目未加入总线 → 静默放行
+    except Exception:
+        sys.exit(0)
+
+    if ev == "pre_tool_use":
+        cwd = info.get("cwd") or os.getcwd()
+        fp = info.get("file_path")
+        tool = info.get("tool") or ""
+        if fp:
+            rel = rel_under(fp, cwd)
+            if rel is None:
+                sys.exit(0)
+            hook_check_lock(conf, args.cli, rel, auto_lock=bool(WRITE_TOOL_RE.search(tool)))
+        elif info.get("command") and BASH_TOOL_RE.search(tool):
+            for t in sniff_bash_writes(info["command"]):
+                rel = rel_under(t, cwd)
+                if rel:
+                    hook_check_lock(conf, args.cli, rel, auto_lock=False)
+        sys.exit(0)
+
+    if ev in ("stop", "heartbeat", "session_start"):
+        ok, r = api_soft(conf, "POST", "/api/heartbeat",
+                         {"peer": conf["peer_id"]}, timeout=5)
+        if not ok:
+            sys.exit(0)
+        urgent = r.get("unread_blocking", 0) + r.get("handoff_offers", 0)
+        if urgent and ev == "stop":
+            hook_block(args.cli,
+                       f"⛔ agent-bus: 你有 {r.get('unread_blocking', 0)} 条阻塞私聊、"
+                       f"{r.get('handoff_offers', 0)} 个待接收交接未处理。"
+                       "先执行 `bus sync` 并处理（reply/resolve/decide/accept/reject），处理完再收工。")
+        if urgent or r.get("unread_normal"):
+            # 心跳/会话开始：只提示不拦截
+            print(f"📨 agent-bus: 阻塞 {r.get('unread_blocking', 0)} / "
+                  f"交接 {r.get('handoff_offers', 0)} / "
+                  f"普通 {r.get('unread_normal', 0)}。建议 `bus sync`。")
+        sys.exit(0)
+
+    sys.exit(0)
+
+
+# ---- install-hooks：为各 CLI 生成配置/插件 ----
+
+HOOK_CLIS = ("claude", "kimi", "codex", "opencode", "pi")
+TOML_MARK_BEGIN = "# >>> agent-bus hooks >>>"
+TOML_MARK_END = "# <<< agent-bus hooks <<<"
+
+
+def bus_cmd():
+    import shlex
+    import shutil
+    b = shutil.which("bus")
+    if b:
+        return shlex.quote(b)
+    return f"{shlex.quote(sys.executable)} {shlex.quote(os.path.abspath(__file__))}"
+
+
+def install_claude(scope, cmd):
+    path = os.path.expanduser("~/.claude/settings.json") if scope == "global" \
+        else os.path.join(".claude", "settings.json")
+    data = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    hooks = data.setdefault("hooks", {})
+
+    def is_ours(entry):
+        return any("hook claude" in (h.get("command") or "")
+                   for h in entry.get("hooks", []))
+
+    wanted = {"PreToolUse": ["Edit|Write|MultiEdit|NotebookEdit", "Bash"],
+              "Stop": [""]}
+    for ev, matchers in wanted.items():
+        lst = [e for e in hooks.get(ev, []) if not is_ours(e)]
+        for matcher in matchers:
+            entry = {"hooks": [{"type": "command", "command": f"{cmd} hook claude"}]}
+            if matcher:
+                entry["matcher"] = matcher
+            lst.append(entry)
+        hooks[ev] = lst
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return path
+
+
+def install_toml(path, cli, cmd, blocks):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    old = ""
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            old = f.read()
+    old = re.sub(re.escape(TOML_MARK_BEGIN) + ".*?" + re.escape(TOML_MARK_END) + "\n?",
+                 "", old, flags=re.S)
+    body = TOML_MARK_BEGIN + "\n" + blocks.replace("{CMD}", cmd) + TOML_MARK_END + "\n"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(old.rstrip() + "\n\n" + body if old.strip() else body)
+    return path
+
+
+KIMI_BLOCKS = """[[hooks]]
+event = "PreToolUse"
+matcher = "Edit|Write|MultiEdit|NotebookEdit|Bash"
+command = "{CMD} hook kimi"
+timeout = 5
+
+[[hooks]]
+event = "Stop"
+command = "{CMD} hook kimi"
+timeout = 10
+
+[[hooks]]
+event = "SessionHeartbeat"
+command = "{CMD} hook kimi"
+timeout = 5
+"""
+
+CODEX_BLOCKS = """[[hooks.PreToolUse]]
+matcher = "Edit|Write|Bash|shell"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "{CMD} hook codex"
+timeout = 5
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "{CMD} hook codex"
+timeout = 10
+"""
+
+OPENCODE_PLUGIN = """// agent-bus opencode 插件：tool.execute.before 自动锁/拦截，session.idle 自动心跳
+// 由 `bus install-hooks --cli opencode` 生成
+import { spawnSync } from "node:child_process"
+
+const BUS = {CMD_JSON} // argv 数组
+
+function runBusHook(payload, cwd) {
+  const r = spawnSync(BUS[0], [...BUS.slice(1), "hook", "opencode"], {
+    input: JSON.stringify(payload),
+    encoding: "utf-8",
+    cwd,
+    timeout: 8000,
+  })
+  return { code: r.status ?? 0, stderr: (r.stderr || "").trim() }
+}
+
+export const AgentBus = async ({ directory }) => {
+  return {
+    "tool.execute.before": async (input, output) => {
+      const args = output.args || {}
+      const res = runBusHook({
+        event: "pre_tool_use",
+        tool: input.tool,
+        file_path: args.filePath || args.file_path || args.path,
+        command: args.command,
+        cwd: directory,
+      }, directory)
+      if (res.code === 2) throw new Error(res.stderr || "blocked by agent-bus")
+    },
+    event: async ({ event }) => {
+      if (event.type === "session.idle") {
+        runBusHook({ event: "heartbeat", cwd: directory }, directory)
+      }
+    },
+  }
+}
+"""
+
+PI_EXTENSION = """// agent-bus pi 扩展：tool_call 自动锁/拦截，turn_end 自动心跳
+// 由 `bus install-hooks --cli pi` 生成
+import { spawnSync } from "node:child_process"
+
+const BUS = {CMD_JSON} // argv 数组
+
+function runBusHook(payload, cwd) {
+  const r = spawnSync(BUS[0], [...BUS.slice(1), "hook", "pi"], {
+    input: JSON.stringify(payload),
+    encoding: "utf-8",
+    cwd,
+    timeout: 8000,
+  })
+  return { code: r.status ?? 0, stderr: (r.stderr || "").trim() }
+}
+
+export default function (pi) {
+  pi.on("tool_call", async (event, ctx) => {
+    const input = event.input || {}
+    const res = runBusHook({
+      event: "pre_tool_use",
+      tool: event.toolName,
+      file_path: input.path || input.file_path || input.filePath,
+      command: input.command,
+      cwd: ctx.cwd,
+    }, ctx.cwd)
+    if (res.code === 2) return { block: true, reason: res.stderr || "blocked by agent-bus" }
+  })
+  pi.on("turn_end", async (_event, ctx) => {
+    runBusHook({ event: "heartbeat", cwd: ctx.cwd }, ctx.cwd)
+  })
+}
+"""
+
+
+def cmd_install_hooks(args):
+    import shlex
+    cmd = bus_cmd()
+    argv_json = json.dumps(shlex.split(cmd))
+    results = []
+    for cli in ([args.cli] if args.cli != "all" else HOOK_CLIS):
+        if cli == "claude":
+            results.append(install_claude(args.scope, cmd))
+        elif cli == "kimi":
+            results.append(install_toml(
+                os.path.expanduser("~/.kimi-code/config.toml"), cli, cmd, KIMI_BLOCKS))
+        elif cli == "codex":
+            results.append(install_toml(
+                os.path.expanduser("~/.codex/config.toml"), cli, cmd, CODEX_BLOCKS))
+        elif cli == "opencode":
+            path = os.path.expanduser("~/.config/opencode/plugins/agent-bus.ts") \
+                if args.scope == "global" else os.path.join(".opencode", "plugins", "agent-bus.ts")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(OPENCODE_PLUGIN.replace("{CMD_JSON}", argv_json))
+            results.append(path)
+        elif cli == "pi":
+            path = os.path.expanduser("~/.pi/agent/extensions/agent-bus/index.ts") \
+                if args.scope == "global" else os.path.join(".pi", "extensions", "agent-bus", "index.ts")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(PI_EXTENSION.replace("{CMD_JSON}", argv_json))
+            results.append(path)
+    print("✓ 已安装 agent-bus hooks：")
+    for r in results:
+        print(f"  {r}")
+    print("协议：PreToolUse 自动锁/冲突拦截，Stop/idle 自动心跳与待办提醒。")
+    print("hub 不可达时默认放行；BUS_HOOK_ENFORCE=1 可改为拦截。")
 
 
 def main():
@@ -958,25 +2059,72 @@ def main():
     p.add_argument("--cli", help="CLI 类型标记，如 kimi/claude/codex")
     p.set_defaults(fn=cmd_join)
 
-    sub.add_parser("sync", help="心跳+收取：新公聊/新改动/私聊（阻塞优先）").set_defaults(fn=cmd_sync)
+    sub.add_parser("sync", help="心跳+收取：新公聊/新改动/私聊/交接/声明").set_defaults(fn=cmd_sync)
     sub.add_parser("status", help="总线全貌").set_defaults(fn=cmd_status)
     sub.add_parser("peers", help="查看各端与权限次序").set_defaults(fn=cmd_peers)
-    sub.add_parser("leave", help="离开总线并释放自己的锁").set_defaults(fn=cmd_leave)
+    sub.add_parser("leave", help="离开总线：释放锁、取消未决交接").set_defaults(fn=cmd_leave)
 
     p = sub.add_parser("lock", help="加锁：目录以 / 结尾；区域锁用 -r 起:止")
     p.add_argument("path")
     p.add_argument("-r", "--region", help="行区间，如 10:50")
     p.add_argument("--note", help="锁备注（要做什么）")
+    p.add_argument("--ttl", type=float, help="租约分钟数（默认 15，操作自动续期）")
+    p.add_argument("--wait", action="store_true", help="冲突时排队，释放后自动获得")
     p.set_defaults(fn=cmd_lock)
 
     p = sub.add_parser("unlock", help="解锁")
     p.add_argument("path", nargs="?")
     p.add_argument("-r", "--region")
-    p.add_argument("--all", action="store_true", help="释放我所有的锁")
+    p.add_argument("--all", action="store_true", help="释放我所有的锁（交接中的除外）")
     p.add_argument("--force", action="store_true", help="强制解别人的锁（需更高权限/主机/对方掉线）")
     p.set_defaults(fn=cmd_unlock)
 
-    sub.add_parser("locks", help="查看当前所有锁").set_defaults(fn=cmd_locks)
+    sub.add_parser("locks", help="查看当前所有锁与等待队列").set_defaults(fn=cmd_locks)
+
+    p = sub.add_parser("claim", help="声明/更新一项工作的归属")
+    p.add_argument("name")
+    p.add_argument("--note", help="这项工作的目标")
+    p.add_argument("--scope", help="活动范围（仅声明，不排他），如 src/auth/")
+    p.add_argument("--status", help="claimed/working/blocked/review")
+    p.add_argument("--waiting-on", dest="waiting_on", help="被哪个 claim 阻塞")
+    p.set_defaults(fn=cmd_claim)
+
+    p = sub.add_parser("claims", help="查看工作声明")
+    p.add_argument("--all", action="store_true", help="包括 done/abandoned")
+    p.set_defaults(fn=cmd_claims)
+
+    p = sub.add_parser("unclaim", help="关闭 claim（默认 done）")
+    p.add_argument("name")
+    p.add_argument("--abandoned", action="store_true")
+    p.set_defaults(fn=cmd_unclaim)
+
+    p = sub.add_parser("handoff", help="把工作（claim+锁+上下文）交接给另一端")
+    p.add_argument("target", help="对端名字，或 anyone（开放式交接）")
+    p.add_argument("claim", help="要交接的 claim 名")
+    p.add_argument("--goal", help="目标（默认用 claim 的 note）")
+    p.add_argument("--state", help="当前进度")
+    p.add_argument("--blockers", help="逗号分隔的阻塞项")
+    p.add_argument("--next", dest="next", help="下一步动作（必填）")
+    p.add_argument("--patch", action="store_true", help="工作区有未提交改动时打包 diff 随交接携带")
+    p.set_defaults(fn=cmd_handoff)
+
+    p = sub.add_parser("capsule", help="查看交接 capsule 详情")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_capsule)
+
+    p = sub.add_parser("accept", help="接收交接（claim 与锁原子转移）")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_accept)
+
+    p = sub.add_parser("reject", help="拒绝/取消交接")
+    p.add_argument("id")
+    p.add_argument("reason", nargs="*")
+    p.set_defaults(fn=cmd_reject)
+
+    p = sub.add_parser("takeover", help="接管掉线方的 claim（合成事故现场 capsule）")
+    p.add_argument("claim")
+    p.add_argument("--reason", help="接管原因")
+    p.set_defaults(fn=cmd_takeover)
 
     p = sub.add_parser("done", help="记录一次改动（别人 sync 可见）")
     p.add_argument("summary")
@@ -988,6 +2136,11 @@ def main():
     p = sub.add_parser("log", help="改动历史（类似 git log）")
     p.add_argument("-n", type=int, default=20)
     p.set_defaults(fn=cmd_log)
+
+    p = sub.add_parser("events", help="事件流（审计/回溯）")
+    p.add_argument("-n", type=int, default=30)
+    p.add_argument("--type", help="按类型前缀过滤，如 lock. / handoff. / claim.")
+    p.set_defaults(fn=cmd_events)
 
     p = sub.add_parser("say", help="发消息：say all=公聊；say <名字>=私聊")
     p.add_argument("target", help="all 或对端名字")
@@ -1026,6 +2179,16 @@ def main():
     p.add_argument("section", nargs="?")
     p.add_argument("text", nargs="*")
     p.set_defaults(fn=cmd_board)
+
+    p = sub.add_parser("hook", help="（给各 CLI 的 hook 调用，非人用）从 stdin 读 payload")
+    p.add_argument("cli", choices=list(HOOK_CLIS))
+    p.set_defaults(fn=cmd_hook)
+
+    p = sub.add_parser("install-hooks", help="为 CLI 安装自动锁/自动同步 hook")
+    p.add_argument("cli", choices=list(HOOK_CLIS) + ["all"])
+    p.add_argument("--scope", choices=["project", "global"], default="global",
+                   help="claude/opencode/pi 支持 project 级，默认 global")
+    p.set_defaults(fn=cmd_install_hooks)
 
     args = ap.parse_args()
     args.fn(args)
