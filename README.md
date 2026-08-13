@@ -141,9 +141,27 @@ bus install-hooks all               # 全部
 ```
 
 - 原理：`bus hook <cli>` 从 stdin 读各 CLI 的 hook payload，exit 0 放行 / exit 2 拦截（stderr 即拦截原因，会回灌给模型）。
-- 覆盖：Edit/Write 类工具自动锁；Bash 类工具嗅探 `>`、`tee`、`sed -i` 的写入目标做冲突拦截（尽力而为，允许漏判）；Stop/idle 事件自动心跳，有阻塞私聊或待接收交接时拦截收工。
+- 覆盖：Edit/Write 类工具自动锁；Bash 类工具嗅探 `>`、`tee`、`sed -i` 的写入目标做冲突拦截（尽力而为，允许漏判）；Stop/idle 事件自动心跳，有阻塞私聊或待接收交接时拦截收工；SessionStart 时列出未读消息提醒先处理（v0.4.1+）。
 - 已实测：Claude Code 与 Kimi Code 的 payload 协议（exit 2 / stderr / JSON 语义）。Codex 的 hooks 配置按其官方"Claude 风格"文档生成，OpenCode/PI 按官方插件文档生成——这三家请以实际版本实测为准。
 - hub 不可达时默认 fail-open（放行）；`BUS_HOOK_ENFORCE=1` 切换为 fail-closed。
+
+### 各 CLI 的 hook 注册差异
+
+不同 agent 的 hook **注册方式不一样**：配置文件格式、挂载事件、以及"回合开始"支持情况都有区别，别跨 CLI 套用。
+
+| CLI | 注册文件（global） | 格式 | 写文件拦截 | 结束拦截/心跳 | 回合开始看消息 |
+|---|---|---|---|---|---|
+| claude | `~/.claude/settings.json` | JSON `hooks.{Event}` | ✅ PreToolUse（Edit/Write 自动锁、Bash 嗅探） | ✅ Stop（阻塞私聊/交接时拦截收工） | ✅ SessionStart |
+| kimi | `~/.kimi-code/config.toml` | TOML `[[hooks]]` | ✅ PreToolUse | ✅ Stop + SessionHeartbeat | ✅ SessionStart |
+| codex | `~/.codex/config.toml` | TOML `[[hooks.{Event}]]` | ✅ PreToolUse | ✅ Stop | ✅ SessionStart |
+| opencode | `~/.config/opencode/plugins/agent-bus.ts` | TS 插件 | ✅ tool.execute.before | ✅ session.idle → 心跳 | ❌ 平台无 start 事件 |
+| pi | `~/.pi/agent/extensions/agent-bus/index.ts` | TS 扩展 | ✅ tool_call | ✅ turn_end → 心跳 | ❌ 平台无 start 事件 |
+
+要点：
+- **会话级差异**：claude/kimi/codex 是配置声明式（`bus install-hooks` 往配置里写事件条目，卸载=删标记段）；opencode/pi 是生成 TS 插件/扩展文件（卸载=删文件）。
+- **回合开始看消息**（v0.4.1 起）：仅 claude/kimi/codex 生效（注册了 SessionStart）；opencode/pi 平台没有 start 事件，只能靠写拦截与空闲心跳。
+- **同一个 `bus hook <cli>` 命令处理所有事件**：差异只在"哪个 CLI 在哪个时机调它"。
+- `install-hooks` 对已存在的配置是**合并**（claude 保留其他 hook；toml 用 `# >>> agent-bus hooks >>>` 标记段，重装幂等），不会覆盖你已有的其他 hook。
 
 ## 已知取舍
 

@@ -31,7 +31,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 TTL = 600                     # peer 心跳有效期（秒），超时视为掉线
 LOCK_LEASE = 900              # 锁租约（秒），持锁者任何操作自动续期
 LOCK_LEASE_MAX = 8 * 3600     # 自定义 --ttl 上限
@@ -2113,7 +2113,8 @@ def install_claude(scope, cmd):
                    for h in entry.get("hooks", []))
 
     wanted = {"PreToolUse": ["Edit|Write|MultiEdit|NotebookEdit", "Bash"],
-              "Stop": [""]}
+              "Stop": [""],
+              "SessionStart": [""]}
     for ev, matchers in wanted.items():
         lst = [e for e in hooks.get(ev, []) if not is_ours(e)]
         for matcher in matchers:
@@ -2157,6 +2158,11 @@ timeout = 10
 event = "SessionHeartbeat"
 command = "{CMD} hook kimi"
 timeout = 5
+
+[[hooks]]
+event = "SessionStart"
+command = "{CMD} hook kimi"
+timeout = 5
 """
 
 CODEX_BLOCKS = """[[hooks.PreToolUse]]
@@ -2170,6 +2176,13 @@ timeout = 5
 [[hooks.Stop]]
 
 [[hooks.Stop.hooks]]
+type = "command"
+command = "{CMD} hook codex"
+timeout = 10
+
+[[hooks.SessionStart]]
+
+[[hooks.SessionStart.hooks]]
 type = "command"
 command = "{CMD} hook codex"
 timeout = 10
