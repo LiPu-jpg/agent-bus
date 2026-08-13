@@ -42,11 +42,31 @@ python3 bus.py handoff B auth-v2 --state "实现80%" --next "改 tests" --patch
 
 ## 多机互联（含 Tailscale 自动支持）
 
-- **没装 Tailscale？** `bus net setup` 一条命令引导安装：macOS 走 Homebrew、Linux 走官方脚本，自动装好后启动守护进程，只在两个绕不开的人工点停下——sudo 密码、浏览器登录 tailnet 授权。`bus net status` 随时查看状态。
-- `bus serve` 自动探测 **Tailscale IPv4**（`tailscale ip -4`）：检测到就把它作为首选广告地址，未检测到回退局域网 IP 并提示安装。所有候选地址（Tailscale / 局域网 / 本机）都会写进 `.bus/hub.json` 的 `alt_urls`。
-- `bus join`（不带 `--hub`，读 hub.json）会**逐个探测候选地址、自动选路**，主地址不通自动换备选——你在公司局域网 join 过一次，回家切到 Tailscale 也无需改任何配置。
-- 也就是说：多台机器装好 Tailscale 后，整个互联是**零配置**的，而且流量走 WireGuard 加密，顺带解决明文 HTTP 的问题。
-- 没有 Tailscale 的可选方案：Cloudflare Tunnel（`cloudflared tunnel --url http://localhost:8977`，零对端安装、白送 TLS）、SSH 反向隧道（`autossh -R 8977:localhost:8977 user@vps`）。
+| 场景 | 做法 |
+|---|---|
+| 单机多会话 | 任一会话 `serve`，其余 `join` 本机地址 |
+| 多机同一局域网 | 任一机 `serve`，其余 join 其局域网 IP |
+| 多机跨公网 / 云服务器 | **打通加密通道**：Tailscale（首选）或内网穿透（Cloudflare Tunnel / SSH 反向隧道 / frp） |
+
+- **Tailscale（首选，零配置）**：`bus net setup` 一条命令引导安装（macOS Homebrew / Linux 官方脚本，只需 sudo 密码与浏览器登录 tailnet 授权），`bus net status` 查看状态。所有机器装好并登录同一 tailnet 后：`bus serve` 自动探测 Tailscale IPv4 并作为首选广告地址（100.x），流量走 WireGuard 加密（顺带解决明文 HTTP 问题）；`bus join`（不带 `--hub`，读 hub.json）会**逐个探测候选地址、自动选路**，主地址不通自动换备选——在公司局域网 join 过一次，回家切 Tailscale 无需改配置。
+- **没有 Tailscale 时用内网穿透**：
+  - Cloudflare Tunnel：hub 机 `cloudflared tunnel --url http://localhost:8977`，得到 `https://xxxx.trycloudflare.com`，对端 `bus join --hub 'https://xxxx.trycloudflare.com#<token>'`（零对端安装、白送 TLS）；
+  - SSH 反向隧道：hub 机 `autossh -R 8977:localhost:8977 user@vps`，对端用 vps 公网地址 join；
+  - frp：hub 机跑 frpc 连你的 frps，对端用 frps 映射的地址 join。
+- ⚠ agent-bus 是明文 HTTP + token，只适合可信网络（Tailscale / VPN / 内网穿透隧道），不要裸暴露到公网。
+
+## 项目分隔：一个项目一个 hub
+
+agent-bus 的**隔离单位是 hub**：黑板、公聊、私聊、声明、锁、改动历史全部挂在单个 hub 数据目录（默认 `.bus/`）下。**每个项目开自己的 hub**，上下文（对话框 + 黑板）天然隔离：
+
+```bash
+cd ~/proj-A && python3 bus.py serve --dir .bus --port 8977   # 项目 A
+cd ~/proj-B && python3 bus.py serve --dir .bus --port 8978   # 项目 B（同机另一端口）
+```
+
+- 数据目录 `.bus/` 提交进项目 git：clone 项目后 `bus join`（读 hub.json）自动发现地址与 token，直接加入该项目自己的总线；黑板与事件流顺带随仓库持久化。
+- 同时参与多个 hub：每个 hub 各存一份身份文件，用 `BUS_PEER_FILE=/path/<hub>.<名字>.json` 切换。
+- 同一项目内多人/多会话：不同 `--name` 加入同一 hub，靠 claim/lock 协作；不要把多项目混进一个 hub。
 
 ## 命令速查
 
