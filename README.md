@@ -59,7 +59,7 @@ python3 bus.py handoff B auth-v2 --state "实现80%" --next "改 tests" --patch
 | `claims [--all]` / `unclaim <名> [--abandoned]` | 查看 / 关闭工作声明 |
 | `lock <路径> [-r 起:止] [--ttl 分钟] [--wait]` | 加锁：目录（`/`结尾）/文件/区域；租约；排队 |
 | `unlock <路径> \| --all [--force]` | 解锁；force 需更高权限/主机/对方掉线 |
-| `locks` / `peers` / `status` | 看锁与等待队列 / 各端与权限 / 全貌 |
+| `locks` / `peers [rm <名字>]` / `status` | 看锁与等待队列 / 各端与权限（主机可移除掉线 peer）/ 全貌 |
 | `handoff <对方\|anyone> <claim> [--state] [--blockers] [--next] [--patch]` | 发起交接（两阶段） |
 | `capsule <hid>` / `accept <hid>` / `reject <hid>` | 看交接详情 / 接收 / 拒绝 |
 | `takeover <claim> --reason "..."` | 接管掉线（或低权限）方的工作 |
@@ -68,7 +68,8 @@ python3 bus.py handoff B auth-v2 --state "实现80%" --next "改 tests" --patch
 | `say all "..."` | 公聊 |
 | `say <名字> "..." [--blocking] [--rounds N] [--deadline M]` | 私聊；阻塞型限定回合与时限 |
 | `reply / resolve / decide / thread` | 私聊回复 / 共识归档 / 高权限裁决 / 看全文 |
-| `board` / `board add <分区> "..."` | 共享黑板 |
+| `board` / `board add <分区> "..."` / `board reset`（主机） | 共享黑板：查看 / 追加 / 重置（先 `bus archive` 归档） |
+| `archive <目录>` | 归档黑板/公聊/私聊/改动/声明到本地目录，重置与审计用 |
 | `leave` | 离开：释放锁、取消未决交接 |
 
 ## 关键语义
@@ -131,10 +132,18 @@ bus install-hooks all               # 全部
 - 死锁检测（A 等 B、B 等 A 成环）暂未实现，等待队列已是 FIFO，环检测在 roadmap。
 - 消息/事件流无上限截断（查询只返回最近 N 条），规模大了再做分片与 compaction。
 
+## v0.4 变更
+
+- **健壮性**：hub 对数据文件缺失零崩溃——`board.md`/`changes/`/`capsules/` 按需懒创建（此前 board.md 被外部清理后 `POST /api/board` 直接断连）；handler 兜底捕获 `OSError`/未知异常并返回 5xx JSON（此前崩溃导致客户端只看到连接断开）。
+- **运维**：`bus serve` 检测数据目录在系统临时目录（/tmp 等）时打印迁移警告——macOS periodic daily 按 atime 清理 /tmp 超 3 天未访问文件，会静默清掉 `board.md`/`hub.json`/`bus.py`。
+- **新命令**：`bus board reset`（主机权限，重置黑板为初始模板）、`bus archive <目录>`（归档黑板/公聊/私聊/改动/声明，重置前必做）、`bus peers rm <名字>`（主机权限，移除掉线 peer 并释放其锁）。
+- **join 去重**：同名 peer 在线时拒绝（409）；同名离线时自动回收旧条目，避免重 join 产生重复残留（此前会永久留两条同名 peer）。
+
 ## Roadmap
 
 - v0.1 ✅ 锁/私聊/裁决/改动历史/黑板
 - v0.2 ✅ Event Log、Claim、Handoff/Takeover、锁租约与等待队列
 - v0.3 ✅ CLI hooks：自动锁/冲突拦截/自动心跳，支持 Claude Code、Kimi Code、Codex、OpenCode、PI
-- v0.4 规划：结构化消息（--type finding/blocker + ACK）、`bus assign` 任务下发、scope 命名空间、decision versioning（supersede/revoke）、死锁检测、`sync --wait` long-polling
+- v0.4 ✅ 健壮性（数据文件懒创建 + handler 兜底 5xx）、board reset / archive / peers rm、join 去重、临时目录警告
+- v0.5 规划：结构化消息（--type finding/blocker + ACK）、`bus assign` 任务下发、scope 命名空间、decision versioning（supersede/revoke）、死锁检测、`sync --wait` long-polling
 - 更远的：capability registry、agentd（watch 事件流自动起 headless agent）、MCP/ACP adapter、hub replication

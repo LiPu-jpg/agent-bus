@@ -22,6 +22,7 @@ description: 多端/多 CLI agent 协作总线。当同一项目存在多个 age
 - **Handoff（交接）**：把一个未完成的工作**原子地**转给另一端——claim 归属、所持锁、上下文 capsule（目标/现状/阻塞/下一步/相关私聊与改动/wip patch）一起走。
 - **Takeover（接管）**：对方掉线时的被动接手，bus 从事件流合成事故现场 capsule（标记 partial）。
 - **Event Log**：一切状态变更记入 `events.jsonl`，`bus events` 可查可审计。
+- **清理轮次（v0.4）**：开新轮次前先 `bus archive <目录>` 归档（黑板/公聊/私聊/改动/声明），再 `bus board reset`（仅主机）重置黑板；残留的掉线测试 peer 用 `bus peers rm <名字>`（仅主机）清理。join 已自动去重：同名在线拒绝、同名离线回收旧条目。
 
 ## 会话开始（必须，按顺序）
 

@@ -22,6 +22,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -30,7 +31,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 TTL = 600                     # peer 心跳有效期（秒），超时视为掉线
 LOCK_LEASE = 900              # 锁租约（秒），持锁者任何操作自动续期
 LOCK_LEASE_MAX = 8 * 3600     # 自定义 --ttl 上限
@@ -175,6 +176,18 @@ class Bus:
 
     def join(self, name, host, cli):
         with self.mu:
+            if name:
+                dup = next((p for p in self.state["peers"].values()
+                            if p["name"] == name), None)
+                if dup:
+                    if self.alive(dup):
+                        raise BusError(
+                            409, f"同名 peer「{name}」在线（rank{dup['rank']}），"
+                                 f"请换 --name 或先与其协调")
+                    # 离线同名：回收旧条目再入队，避免重复残留
+                    del self.state["peers"][dup["id"]]
+                    self._emit("peer.left", peer=name, released_locks=0,
+                               reason="replaced-on-rejoin")
             pid = short_id()
             rank = self.state["peer_seq"]
             self.state["peer_seq"] += 1
@@ -625,6 +638,7 @@ class Bus:
             hid = f"h{self.state['handoff_seq']}"
             patch_file = None
             if wip_patch:
+                os.makedirs(os.path.join(self.dir, "capsules"), exist_ok=True)
                 patch_file = f"capsules/{hid}-wip.patch"
                 with open(os.path.join(self.dir, patch_file), "w", encoding="utf-8") as f:
                     f.write(wip_patch)
@@ -806,6 +820,7 @@ class Bus:
             cid = self.state["change_seq"]
             detail_file = None
             if detail:
+                os.makedirs(os.path.join(self.dir, "changes"), exist_ok=True)
                 slug = re.sub(r"[^\w一-鿿-]+", "-", summary).strip("-")[:40]
                 detail_file = f"changes/{cid:04d}-{slug}.md"
                 with open(os.path.join(self.dir, detail_file), "w", encoding="utf-8") as f:
@@ -826,7 +841,14 @@ class Bus:
 
     # ---- 黑板 ----
 
+    def _ensure_board(self):
+        if not os.path.exists(self.board_path):
+            os.makedirs(os.path.dirname(self.board_path), exist_ok=True)
+            with open(self.board_path, "w", encoding="utf-8") as f:
+                f.write("# 共享黑板\n\n> 所有端共同维护。结论性内容写这里，过程讨论去公聊/私聊。\n")
+
     def _board_append(self, section, text):
+        self._ensure_board()
         with open(self.board_path, encoding="utf-8") as f:
             lines = f.read().splitlines()
         heading = f"## {section}"
@@ -849,6 +871,50 @@ class Bus:
             self._board_append(section, text)
             self._emit("board.appended", actor=me["name"], section=section)
             self.save()
+
+    def board_reset(self, pid):
+        """主机专用：黑板重置为初始模板。历史内容请先 bus archive 归档。"""
+        me = self.get_peer(pid)
+        with self.mu:
+            host = self.host_peer()
+            if host is None or host["id"] != pid:
+                raise BusError(403, "只有当前主机可以重置黑板（可先 bus takeover 或与主机协调）")
+            self._ensure_board()
+            with open(self.board_path, "w", encoding="utf-8") as f:
+                f.write("# 共享黑板\n\n> 所有端共同维护。结论性内容写这里，过程讨论去公聊/私聊。\n")
+            self._emit("board.resetted", actor=me["name"])
+            self.save()
+
+    def peer_rm(self, pid, target):
+        """主机专用：移除掉线 peer（释放其锁、废弃其 claim、清等待队列）。"""
+        me = self.get_peer(pid)
+        with self.mu:
+            host = self.host_peer()
+            if host is None or host["id"] != pid:
+                raise BusError(403, "只有当前主机可以移除 peer")
+            tgt = next((p for p in self.state["peers"].values()
+                        if p["name"] == target or p["id"] == target), None)
+            if not tgt:
+                raise BusError(404, f"未知 peer: {target}")
+            if tgt["id"] == pid:
+                raise BusError(400, "不能移除自己")
+            released = [k for k, l in self.state["locks"].items()
+                        if l["owner"] == tgt["id"]]
+            for k in released:
+                del self.state["locks"][k]
+            self.state["waiters"] = [w for w in self.state["waiters"]
+                                     if w["peer"] != tgt["id"]]
+            for c in self.state["claims"].values():
+                if c["owner"] == tgt["id"] and c["status"] not in ("done", "abandoned"):
+                    c["status"] = "abandoned"
+                    c["updated"] = now()
+            del self.state["peers"][tgt["id"]]
+            self._emit("peer.left", peer=tgt["name"], released_locks=len(released),
+                       reason="removed-by-host")
+            if released:
+                self._grant_waiters()
+            self.save()
+            return {"ok": True, "removed": tgt["name"], "released_locks": len(released)}
 
     def heartbeat(self, pid):
         """轻量心跳：续期/保活 + 返回待办计数，不标记已读（供 hook 自动调用）。"""
@@ -1060,6 +1126,11 @@ def make_handler(bus):
                 if method == "POST" and path == "/api/board":
                     bus.board_append(b["peer"], b["section"], b["text"])
                     return self._send(200, {"ok": True})
+                if method == "POST" and path == "/api/board/reset":
+                    bus.board_reset(b["peer"])
+                    return self._send(200, {"ok": True})
+                if method == "POST" and path == "/api/peers/rm":
+                    return self._send(200, bus.peer_rm(b["peer"], b["name"]))
                 if method == "POST" and path == "/api/heartbeat":
                     return self._send(200, bus.heartbeat(b["peer"]))
                 if method == "GET" and path == "/api/sync":
@@ -1080,6 +1151,10 @@ def make_handler(bus):
                 return self._send(e.code, {"error": e.msg})
             except (KeyError, ValueError, TypeError) as e:
                 return self._send(400, {"error": f"参数错误: {e}"})
+            except OSError as e:
+                return self._send(500, {"error": f"hub 存储错误: {e}"})
+            except Exception as e:
+                return self._send(500, {"error": f"hub 内部错误: {type(e).__name__}: {e}"})
 
     return Handler
 
@@ -1137,6 +1212,15 @@ def cmd_serve(args):
     if not ts_ip:
         print("  提示：未检测到 Tailscale。多机跨网络协作建议安装（https://tailscale.com），"
               "装好后重启 serve 即自动广告 Tailscale 地址，零额外配置。")
+    apath = os.path.realpath(bus.dir)
+    tmp_roots = [os.path.realpath(r) for r in
+                 ("/tmp", "/private/tmp", "/var/tmp", tempfile.gettempdir())]
+    if apath in tmp_roots or any(apath.startswith(r + os.sep) for r in tmp_roots):
+        print("  ⚠ 数据目录在系统临时目录下，可能被系统定期清理"
+              "（如 macOS periodic daily 按 atime 清理超 3 天未访问文件），"
+              "导致 board.md/hub.json 等静默丢失、board 写入崩溃。"
+              "建议迁到项目目录：停 serve → 移动数据目录 → 原目录重新 serve"
+              "（token 不变，对端无需重新 join）。")
     print(f"（若 {args.dir} 随项目 git 同步，对端也可直接 bus join 自动发现+自动选路）")
     httpd = ThreadingHTTPServer(("", args.port), make_handler(bus))
     try:
@@ -1670,13 +1754,61 @@ def cmd_board(args):
             {"peer": conf["peer_id"], "section": args.section,
              "text": " ".join(args.text)})
         print(f"✓ 已写入黑板「{args.section}」")
+    elif args.board_cmd == "reset":
+        api(conf, "POST", "/api/board/reset", {"peer": conf["peer_id"]})
+        print("✓ 黑板已重置为初始模板（历史内容请先 bus archive 归档）")
     else:
         v = api(conf, "GET", "/api/board")
         print(v["board"])
 
 
+def cmd_archive(args):
+    """把总线内容（黑板/公聊/私聊/改动/声明/事件）归档到本地目录，供重置或审计。"""
+    conf = load_conf()
+    out = os.path.abspath(args.path)
+    os.makedirs(out, exist_ok=True)
+    os.makedirs(os.path.join(out, "threads"), exist_ok=True)
+    st = api(conf, "GET", "/api/status")
+    board = api(conf, "GET", "/api/board")["board"]
+    with open(os.path.join(out, "board.md"), "w", encoding="utf-8") as f:
+        f.write(board)
+
+    def _write(name, content):
+        with open(os.path.join(out, name), "w", encoding="utf-8") as f:
+            f.write(content)
+
+    chat = "\n".join(f"[{fmt_time(m['ts'])}] {m['from_name']}: {m['body']}"
+                     for m in st["public"]) or "公聊还没有消息。"
+    _write("chat.md", chat + "\n")
+    changes = "\n".join(
+        f"- #{c['id']} [{fmt_time(c['ts'])}] {c['name']}: {c['summary']}"
+        f" files={c.get('files')} commit={c.get('commit')}"
+        for c in st["changes"]) or "还没有改动记录。"
+    _write("changes.md", changes + "\n")
+    claims = "\n".join(
+        f"- {c['name']} [{c['status']}] owner={c.get('owner_name')}"
+        f" scope={c.get('scope')} note={c.get('note')}"
+        for c in st["claims"]) or "没有工作声明。"
+    _write("claims.md", claims + "\n")
+    for t in st["threads"]:
+        th = api(conf, "GET", f"/api/thread?id={t['id']}")
+        body = f"# {t['id']} [{t['status']}] {t['topic']}\n\n"
+        body += f"blocking={t['blocking']} rounds_left={t['rounds_left']}\n\n"
+        for m in th.get("messages", []):
+            body += f"[{fmt_time(m['ts'])}] {m['from_name']}: {m['body']}\n\n"
+        _write(f"threads/{t['id']}.md", body)
+    print(f"✓ 已归档到 {out}（board.md / chat.md / changes.md / claims.md / threads/）")
+
+
 def cmd_peers(args):
     conf = load_conf()
+    if args.rm == "rm":
+        if not args.name:
+            die("用法: bus peers rm <名字>")
+        r = api(conf, "POST", "/api/peers/rm",
+                {"peer": conf["peer_id"], "name": args.name})
+        print(f"✓ 已移除 peer「{r['removed']}」，释放 {r['released_locks']} 个锁")
+        return
     v = api(conf, "GET", "/api/status")
     for p in v["peers"]:
         mark = "👑" if p["id"] == v["host"] else " "
@@ -2152,7 +2284,10 @@ def main():
 
     sub.add_parser("sync", help="心跳+收取：新公聊/新改动/私聊/交接/声明").set_defaults(fn=cmd_sync)
     sub.add_parser("status", help="总线全貌").set_defaults(fn=cmd_status)
-    sub.add_parser("peers", help="查看各端与权限次序").set_defaults(fn=cmd_peers)
+    p = sub.add_parser("peers", help="查看各端与权限次序；rm <名字> 由主机移除掉线 peer")
+    p.add_argument("rm", nargs="?", choices=["rm"])
+    p.add_argument("name", nargs="?")
+    p.set_defaults(fn=cmd_peers)
     sub.add_parser("leave", help="离开总线：释放锁、取消未决交接").set_defaults(fn=cmd_leave)
 
     p = sub.add_parser("lock", help="加锁：目录以 / 结尾；区域锁用 -r 起:止")
@@ -2265,11 +2400,15 @@ def main():
     p.add_argument("-n", type=int, default=30)
     p.set_defaults(fn=cmd_chat)
 
-    p = sub.add_parser("board", help="共享黑板：无参查看；add <分区> <内容> 追加")
-    p.add_argument("board_cmd", nargs="?", choices=["add"])
+    p = sub.add_parser("board", help="共享黑板：无参查看；add <分区> <内容> 追加；reset 由主机重置")
+    p.add_argument("board_cmd", nargs="?", choices=["add", "reset"])
     p.add_argument("section", nargs="?")
     p.add_argument("text", nargs="*")
     p.set_defaults(fn=cmd_board)
+
+    p = sub.add_parser("archive", help="归档总线内容（黑板/公聊/私聊/改动/声明）到目录")
+    p.add_argument("path")
+    p.set_defaults(fn=cmd_archive)
 
     p = sub.add_parser("hook", help="（给各 CLI 的 hook 调用，非人用）从 stdin 读 payload")
     p.add_argument("cli", choices=list(HOOK_CLIS))
