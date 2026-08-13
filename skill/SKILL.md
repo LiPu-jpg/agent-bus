@@ -42,7 +42,7 @@ cd ~/proj-B && python3 bus.py serve --dir .bus --port 8978   # 项目 B（同机
 
 ## Hooks（机制层，装了更稳）
 
-`bus install-hooks <claude|kimi|codex|opencode|pi>` 会在对应 CLI 注册 hook：写文件工具调用前**自动加锁**（锁冲突则本次调用被拦截，原因回灌给你）；bash 命令里的重定向写入做冲突嗅探；回合结束自动心跳，有阻塞私聊/待接收交接时**拦截收工**。装了 hooks 之后下面的纪律依然要遵守（hooks 只管锁和提醒，不管 claim/done/handoff 的语义）。hub 不可达时 hook 默认放行。
+`bus install-hooks <claude|kimi|codex|opencode|pi>` 会在对应 CLI 注册 hook：写文件工具调用前**自动加锁**（锁冲突则本次调用被拦截，原因回灌给你）；bash 命令里的重定向写入做冲突嗅探；**回合开始（SessionStart）列出未读消息**、回合结束自动心跳，有阻塞私聊/待接收交接时**拦截收工**。注意：claude/kimi/codex 是配置式注册（支持回合开始看消息）；opencode/pi 是插件式（仅写拦截 + 空闲心跳）。装了 hooks 之后下面的纪律依然要遵守（hooks 只管锁和提醒，不管 claim/done/handoff 的语义）。hub 不可达时 hook 默认放行。
 
 ## 核心概念
 
