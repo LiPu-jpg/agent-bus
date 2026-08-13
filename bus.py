@@ -31,7 +31,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 TTL = 600                     # peer 心跳有效期（秒），超时视为掉线
 LOCK_LEASE = 900              # 锁租约（秒），持锁者任何操作自动续期
 LOCK_LEASE_MAX = 8 * 3600     # 自定义 --ttl 上限
@@ -917,18 +917,33 @@ class Bus:
             return {"ok": True, "removed": tgt["name"], "released_locks": len(released)}
 
     def heartbeat(self, pid):
-        """轻量心跳：续期/保活 + 返回待办计数，不标记已读（供 hook 自动调用）。"""
+        """轻量心跳：续期/保活 + 返回待办详情（含未读消息/交接条目），不标记已读。"""
         self.sweep()
         self.get_peer(pid)
         with self.mu:
             inbox = self.state["inbox"].get(pid, [])
-            ub = sum(1 for m in inbox if not m["read"] and m["blocking"])
-            un = sum(1 for m in inbox if not m["read"] and not m["blocking"])
-            offers = sum(1 for h in self.state["handoffs"].values()
-                         if h["status"] == "offered" and h["to"] in (None, pid))
+            unread = [m for m in inbox if not m["read"]]
+            ub = sum(1 for m in unread if m["blocking"])
+            un = sum(1 for m in unread if not m["blocking"])
+            offers = [h for h in self.state["handoffs"].values()
+                      if h["status"] == "offered" and h["to"] in (None, pid)]
             self.save()
-            return {"unread_blocking": ub, "unread_normal": un,
-                    "handoff_offers": offers}
+            return {
+                "unread_blocking": ub,
+                "unread_normal": un,
+                "handoff_offers": len(offers),
+                "blocking_items": [
+                    {"thread": m.get("thread"), "from": m.get("from_name"),
+                     "body": (m.get("body") or "")[:120]}
+                    for m in unread if m["blocking"]],
+                "normal_items": [
+                    {"thread": m.get("thread"), "from": m.get("from_name"),
+                     "body": (m.get("body") or "")[:120]}
+                    for m in unread if not m["blocking"]],
+                "handoff_items": [
+                    {"hid": h["id"], "claim": h["claim"], "from": h["from_name"]}
+                    for h in offers],
+            }
 
     def board_read(self):
         with open(self.board_path, encoding="utf-8") as f:
@@ -2048,17 +2063,21 @@ def cmd_hook(args):
                          {"peer": conf["peer_id"]}, timeout=5)
         if not ok:
             sys.exit(0)
-        urgent = r.get("unread_blocking", 0) + r.get("handoff_offers", 0)
-        if urgent and ev == "stop":
-            hook_block(args.cli,
-                       f"⛔ agent-bus: 你有 {r.get('unread_blocking', 0)} 条阻塞私聊、"
-                       f"{r.get('handoff_offers', 0)} 个待接收交接未处理。"
-                       "先执行 `bus sync` 并处理（reply/resolve/decide/accept/reject），处理完再收工。")
-        if urgent or r.get("unread_normal"):
-            # 心跳/会话开始：只提示不拦截
-            print(f"📨 agent-bus: 阻塞 {r.get('unread_blocking', 0)} / "
-                  f"交接 {r.get('handoff_offers', 0)} / "
-                  f"普通 {r.get('unread_normal', 0)}。建议 `bus sync`。")
+        parts = []
+        for it in r.get("blocking_items", []):
+            parts.append(f"  ⛔ 阻塞私聊 {it.get('thread') or ''} ← {it.get('from')}: {it.get('body')}")
+        for it in r.get("handoff_items", []):
+            parts.append(f"  📦 待接收交接 {it['hid']}「{it['claim']}」← {it.get('from')}")
+        for it in r.get("normal_items", []):
+            parts.append(f"  📨 {it.get('thread') or '私聊'} ← {it.get('from')}: {it.get('body')}")
+        if not parts:
+            sys.exit(0)
+        hint = ("先执行 `bus sync` 并处理（reply/resolve/decide/accept/reject），处理完再收工。"
+                if ev == "stop" else "先 `bus sync` 处理完再开始新工作。")
+        msg = "agent-bus 待处理：\n" + "\n".join(parts) + "\n" + hint
+        if ev == "stop" and (r.get("unread_blocking") or r.get("handoff_offers")):
+            hook_block(args.cli, "⛔ " + msg)
+        print("📨 " + msg)
         sys.exit(0)
 
     sys.exit(0)
