@@ -9,6 +9,37 @@ description: 多端/多 CLI agent 协作总线。当同一项目存在多个 age
 
 所有操作通过 `bus` 命令执行（若 `bus` 不在 PATH，用 `python3 <本skill目录>/bus.py` 代替）。
 
+## 部署形态与网络（先想清楚，再遵守纪律）
+
+| 场景 | 做法 | 要点 |
+|---|---|---|
+| 单机多会话 | 任意会话 `bus serve` 起 hub，其余 `join --hub '<本机地址#token>' --name <不同名>` | 同项目多会话必须 `--name` 不同 |
+| 多机同一局域网 | 任意一机 serve，其余 join 其局域网 IP | serve 启动横幅会列出所有可用地址 |
+| 多机跨公网 / 云服务器 | **必须打通一条互通的加密通道**：Tailscale（首选）或内网穿透 | 见下 |
+
+**跨公网 / 云服务器，三选一（按推荐序）**：
+
+1. **Tailscale（首选，零配置）**：所有机器装 Tailscale 并登录同一 tailnet 后，`bus serve` 自动探测并广告 Tailscale IP（100.x），各端 `bus join --hub 'http://<Tailscale IP>:8977#<token>'`，流量走 WireGuard 加密。`bus net setup` 一条命令引导安装。
+2. **Cloudflare Tunnel（不想装 Tailscale 时）**：hub 机执行 `cloudflared tunnel --url http://localhost:8977`，得到 `https://xxxx.trycloudflare.com`，对端 `bus join --hub 'https://xxxx.trycloudflare.com#<token>'`。零对端安装、自带 TLS。
+3. **SSH 反向隧道 / frp（已有跳板机/云主机时）**：hub 机 `autossh -R 8977:localhost:8977 user@vps`（或 frp 客户端连 frps），对端用 vps 公网地址 join。
+
+> ⚠ agent-bus 是明文 HTTP + token，只适合可信网络（Tailscale / VPN / 内网穿透隧道），**不要裸暴露到公网**。
+
+## 项目分隔：一个项目一个 hub（独立上下文 / 对话框 / 黑板）
+
+agent-bus 的**隔离单位是 hub**：黑板、公聊、私聊、工作声明、锁、改动历史全部挂在单个 hub 数据目录（默认 `.bus/`）下。**每个项目开自己的 hub**，上下文天然隔离：
+
+```bash
+cd ~/proj-A && python3 bus.py serve --dir .bus --port 8977   # 项目 A
+cd ~/proj-B && python3 bus.py serve --dir .bus --port 8978   # 项目 B（同机另一端口）
+```
+
+- **一项目一 hub**：A 的对话/黑板/声明不会混进 B；clone 项目后 `bus join`（读项目里 git 同步的 `.bus/hub.json`）即加入该项目自己的总线。
+- **数据目录提交进项目 git**：`.bus/` 随项目走（含 hub.json 的地址与 token），成员 clone 后无需找地址，`bus join` 自动发现 + 自动选路；黑板与事件流顺带持久化。
+- **同机多项目**：不同端口即可（8977/8978/…），各项目目录各跑一个 serve。
+- **同时参与多个 hub**：每个 hub 各存一份身份文件，用 `BUS_PEER_FILE=/path/<hub>.<名字>.json` 切换身份。
+- **同一项目内**：多人/多会话用不同 `--name` 加入同一个 hub，靠 claim/lock 协作；别把多项目混进一个 hub，也别让一个会话同时声明跨项目的工作。
+
 ## Hooks（机制层，装了更稳）
 
 `bus install-hooks <claude|kimi|codex|opencode|pi>` 会在对应 CLI 注册 hook：写文件工具调用前**自动加锁**（锁冲突则本次调用被拦截，原因回灌给你）；bash 命令里的重定向写入做冲突嗅探；回合结束自动心跳，有阻塞私聊/待接收交接时**拦截收工**。装了 hooks 之后下面的纪律依然要遵守（hooks 只管锁和提醒，不管 claim/done/handoff 的语义）。hub 不可达时 hook 默认放行。
@@ -26,7 +57,8 @@ description: 多端/多 CLI agent 协作总线。当同一项目存在多个 age
 
 ## 会话开始（必须，按顺序）
 
-1. 未加入则先加入：`bus join --hub '<url#token>' --name <本端名字>`（同项目多会话必须各起不同 --name；第一个端先 `bus serve`）。
+0. **新项目**：在项目根目录 `bus serve` 起 hub（数据目录 `.bus` 提交进 git）；建议顺手 `bus install-hooks <你的CLI>`（claude/codex/kimi/opencode/pi）。
+1. 未加入则先加入：`bus join --hub '<url#token>' --name <本端名字>`（同项目多会话必须各起不同 --name；已有 hub 的仓库直接 `bus join` 自动发现）。
 2. `bus sync` —— 心跳、看新公聊/新改动、读私聊、看待接收交接、看工作声明。
 3. 有**阻塞私聊或待接收交接**：先处理（reply/resolve/decide、accept/reject），再干别的。
 
