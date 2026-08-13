@@ -154,14 +154,15 @@ bus install-hooks all               # 全部
 | claude | `~/.claude/settings.json` | JSON `hooks.{Event}` | ✅ PreToolUse（Edit/Write 自动锁、Bash 嗅探） | ✅ Stop（阻塞私聊/交接时拦截收工） | ✅ SessionStart |
 | kimi | `~/.kimi-code/config.toml` | TOML `[[hooks]]` | ✅ PreToolUse | ✅ Stop + SessionHeartbeat | ✅ SessionStart |
 | codex | `~/.codex/config.toml` | TOML `[[hooks.{Event}]]` | ✅ PreToolUse | ✅ Stop | ✅ SessionStart |
-| opencode | `~/.config/opencode/plugins/agent-bus.ts` | TS 插件 | ✅ tool.execute.before | ✅ session.idle → 心跳 | ❌ 平台无 start 事件 |
-| pi | `~/.pi/agent/extensions/agent-bus/index.ts` | TS 扩展 | ✅ tool_call | ✅ turn_end → 心跳 | ❌ 平台无 start 事件 |
+| opencode | `~/.config/opencode/plugins/agent-bus.ts` | TS 插件 | ✅ tool.execute.before | ✅ session.idle → 心跳 | ✅ session.created |
+| pi | `~/.pi/agent/extensions/agent-bus/index.ts` | TS 扩展 | ✅ tool_call | ✅ turn_end → 心跳 | ✅ session_start |
 
 要点：
 - **会话级差异**：claude/kimi/codex 是配置声明式（`bus install-hooks` 往配置里写事件条目，卸载=删标记段）；opencode/pi 是生成 TS 插件/扩展文件（卸载=删文件）。
-- **回合开始看消息**（v0.4.1 起）：仅 claude/kimi/codex 生效（注册了 SessionStart）；opencode/pi 平台没有 start 事件，只能靠写拦截与空闲心跳。
+- **回合开始看消息**（v0.4.1+）：五家 CLI 全部支持——claude/kimi/codex 走 SessionStart 事件，opencode 走 `session.created`，pi 走 `session_start`（v0.4.3 补全）。
 - **同一个 `bus hook <cli>` 命令处理所有事件**：差异只在"哪个 CLI 在哪个时机调它"。
 - `install-hooks` 对已存在的配置是**合并**（claude 保留其他 hook；toml 用 `# >>> agent-bus hooks >>>` 标记段，重装幂等），不会覆盖你已有的其他 hook。
+- 事件/格式已按各官方文档与源码核实（2026-08）：Claude Code SessionStart、Codex HookEventsToml（含 SessionStart）、Kimi Code hooks 文档（`~/.kimi-code/config.toml` + `[[hooks]]` event/matcher/command/timeout）、opencode 插件事件表（session.created/idle）、pi 扩展文档（session_start/turn_end）。Codex/opencode/pi 的 payload 协议仍建议以实际版本实测为准。
 
 ## 已知取舍
 
