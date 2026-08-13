@@ -31,7 +31,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 TTL = 600                     # peer 心跳有效期（秒），超时视为掉线
 LOCK_LEASE = 900              # 锁租约（秒），持锁者任何操作自动续期
 LOCK_LEASE_MAX = 8 * 3600     # 自定义 --ttl 上限
@@ -2145,7 +2145,7 @@ def install_toml(path, cli, cmd, blocks):
 
 KIMI_BLOCKS = """[[hooks]]
 event = "PreToolUse"
-matcher = "Edit|Write|MultiEdit|NotebookEdit|Bash"
+matcher = "Edit|Write|MultiEdit|NotebookEdit|Bash|Shell|WriteFile|StrReplaceFile"
 command = "{CMD} hook kimi"
 timeout = 5
 
@@ -2218,8 +2218,11 @@ export const AgentBus = async ({ directory }) => {
       if (res.code === 2) throw new Error(res.stderr || "blocked by agent-bus")
     },
     event: async ({ event }) => {
-      if (event.type === "session.idle") {
-        runBusHook({ event: "heartbeat", cwd: directory }, directory)
+      if (event.type === "session.idle" || event.type === "session.created") {
+        runBusHook({
+          event: event.type === "session.created" ? "session_start" : "heartbeat",
+          cwd: directory,
+        }, directory)
       }
     },
   }
@@ -2253,6 +2256,9 @@ export default function (pi) {
       cwd: ctx.cwd,
     }, ctx.cwd)
     if (res.code === 2) return { block: true, reason: res.stderr || "blocked by agent-bus" }
+  })
+  pi.on("session_start", async (_event, ctx) => {
+    runBusHook({ event: "session_start", cwd: ctx.cwd }, ctx.cwd)
   })
   pi.on("turn_end", async (_event, ctx) => {
     runBusHook({ event: "heartbeat", cwd: ctx.cwd }, ctx.cwd)
