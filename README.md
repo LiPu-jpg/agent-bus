@@ -126,7 +126,7 @@ install -m755 bus.py ~/.local/bin/bus   # 可选：让 bus 直接在 PATH 上
 
 其他 CLI（Claude Code、Codex 等）同理，把 `skill/SKILL.md` 放进它们的指令/技能目录即可——契约是纯文本，与 CLI 无关。
 
-## Hooks：把纪律变成机制（v0.3）
+## Hooks
 
 skill 契约靠 agent 自觉，hooks 把它升级为半强制：**写文件前自动加锁、锁冲突直接拦截这次工具调用、回合结束自动心跳并提醒未处理事项**。
 
@@ -157,32 +157,5 @@ bus install-hooks all               # 全部
 | opencode | `~/.config/opencode/plugins/agent-bus.ts` | TS 插件 | ✅ tool.execute.before | ✅ session.idle → 心跳 | ✅ session.created |
 | pi | `~/.pi/agent/extensions/agent-bus/index.ts` | TS 扩展 | ✅ tool_call | ✅ turn_end → 心跳 | ✅ session_start |
 
-要点：
-- **会话级差异**：claude/kimi/codex 是配置声明式（`bus install-hooks` 往配置里写事件条目，卸载=删标记段）；opencode/pi 是生成 TS 插件/扩展文件（卸载=删文件）。
-- **回合开始看消息**（v0.4.1+）：五家 CLI 全部支持——claude/kimi/codex 走 SessionStart 事件，opencode 走 `session.created`，pi 走 `session_start`（v0.4.3 补全）。
-- **同一个 `bus hook <cli>` 命令处理所有事件**：差异只在"哪个 CLI 在哪个时机调它"。
-- `install-hooks` 对已存在的配置是**合并**（claude 保留其他 hook；toml 用 `# >>> agent-bus hooks >>>` 标记段，重装幂等），不会覆盖你已有的其他 hook。
-- 事件/格式已按各官方文档与源码核实（2026-08）：Claude Code SessionStart、Codex HookEventsToml（含 SessionStart）、Kimi Code hooks 文档（`~/.kimi-code/config.toml` + `[[hooks]]` event/matcher/command/timeout）、opencode 插件事件表（session.created/idle）、pi 扩展文档（session_start/turn_end）。Codex/opencode/pi 的 payload 协议仍建议以实际版本实测为准。
-
-## 已知取舍
-
-- 锁与 claim 是 advisory + hook 半强制（bash 改写文件无法 100% 拦截），`events.jsonl` 全量审计兜底。
-- 网络为明文 HTTP + token，适用于可信内网/VPN（推荐 Tailscale）；跨公网请走 SSH 转发/Cloudflare Tunnel。
-- 死锁检测（A 等 B、B 等 A 成环）暂未实现，等待队列已是 FIFO，环检测在 roadmap。
-- 消息/事件流无上限截断（查询只返回最近 N 条），规模大了再做分片与 compaction。
-
-## v0.4 变更
-
-- **健壮性**：hub 对数据文件缺失零崩溃——`board.md`/`changes/`/`capsules/` 按需懒创建（此前 board.md 被外部清理后 `POST /api/board` 直接断连）；handler 兜底捕获 `OSError`/未知异常并返回 5xx JSON（此前崩溃导致客户端只看到连接断开）。
-- **运维**：`bus serve` 检测数据目录在系统临时目录（/tmp 等）时打印迁移警告——macOS periodic daily 按 atime 清理 /tmp 超 3 天未访问文件，会静默清掉 `board.md`/`hub.json`/`bus.py`。
-- **新命令**：`bus board reset`（主机权限，重置黑板为初始模板）、`bus archive <目录>`（归档黑板/公聊/私聊/改动/声明，重置前必做）、`bus peers rm <名字>`（主机权限，移除掉线 peer 并释放其锁）。
-- **join 去重**：同名 peer 在线时拒绝（409）；同名离线时自动回收旧条目，避免重 join 产生重复残留（此前会永久留两条同名 peer）。
-
-## Roadmap
-
-- v0.1 ✅ 锁/私聊/裁决/改动历史/黑板
-- v0.2 ✅ Event Log、Claim、Handoff/Takeover、锁租约与等待队列
-- v0.3 ✅ CLI hooks：自动锁/冲突拦截/自动心跳，支持 Claude Code、Kimi Code、Codex、OpenCode、PI
-- v0.4 ✅ 健壮性（数据文件懒创建 + handler 兜底 5xx）、board reset / archive / peers rm、join 去重、临时目录警告
-- v0.5 规划：结构化消息（--type finding/blocker + ACK）、`bus assign` 任务下发、scope 命名空间、decision versioning（supersede/revoke）、死锁检测、`sync --wait` long-polling
-- 更远的：capability registry、agentd（watch 事件流自动起 headless agent）、MCP/ACP adapter、hub replication
+## 友链
+友情链接： Linux.do——新的理想型社区
